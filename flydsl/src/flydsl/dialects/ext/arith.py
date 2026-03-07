@@ -592,6 +592,28 @@ def bitcast(
     return ArithValue(result)
 
 
+def uitofp(
+    result_type: Type, value: Union["ArithValue", Value], *, loc: Location = None
+) -> "ArithValue":
+    """Convert unsigned integer value to floating point.
+
+    Args:
+        result_type: Target floating point type (e.g., f32)
+        value: Unsigned integer value to convert
+        loc: Optional source location
+
+    Returns:
+        ArithValue wrapping the floating point result
+
+    Example:
+        >>> i32_val = ...  # unsigned value in i32
+        >>> f32_val = arith.uitofp(T.f32(), i32_val)
+    """
+    val = _unwrap_value(value) if isinstance(value, ArithValue) else value
+    result = _arith.UIToFPOp(result_type, val, loc=loc).result
+    return ArithValue(result)
+
+
 def trunc_f(
     target_type: Type, value: Union["ArithValue", Value], *, loc: Location = None
 ) -> "ArithValue":
@@ -1094,6 +1116,7 @@ from _mlir.dialects.arith import (
     ExtFOp,
     TruncFOp,
     SIToFPOp,
+    UIToFPOp,
     FPToSIOp,
     SelectOp,
 )
@@ -1115,6 +1138,7 @@ __all__ = [
     "extf",
     "fptosi",
     "sitofp",
+    "uitofp",
     "absf",
     "reduce",
     "constant_vector",
@@ -1148,6 +1172,7 @@ __all__ = [
     "ExtFOp",
     "TruncFOp",
     "SIToFPOp",
+    "UIToFPOp",
     "FPToSIOp",
     "SelectOp",
 ]

@@ -511,26 +511,18 @@ def compile_wmma_mixed_preshuffle_gemm(
                         k0 = k_tile_idx * arith.index(reg_k) + arith.index(rk)
                         for rm in range_constexpr(wave_reg_m):
                             m0 = m0_base + arith.index(rm)
-                            # fp8 byte offset
                             byte_off = (
                                 m0 * arith.index(A_STRIDE_M0)
                                 + k0 * arith.index(A_STRIDE_K0)
                                 + klane * arith.index(A_STRIDE_KLANE)
                                 + lane16 * arith.index(A_STRIDE_MLANE)
                             )
-                            # Load 8 bytes as 2 x i32
+                            # Load 8 bytes as dwordx2 (single buffer_load)
                             dword_off = byte_off // arith.index(4)
-                            a0 = buffer_ops.buffer_load(
-                                a_rsrc, dword_off, vec_width=1, dtype=i32
+                            a_raw = buffer_ops.buffer_load(
+                                a_rsrc, dword_off, vec_width=2, dtype=i32
                             )
-                            a1 = buffer_ops.buffer_load(
-                                a_rsrc,
-                                dword_off + arith.index(1),
-                                vec_width=1,
-                                dtype=i32,
-                            )
-                            a_vec = vector.from_elements(v2i32_ty, [a0, a1])
-                            rk_vecs.append(a_vec)
+                            rk_vecs.append(a_raw)
                         a_vecs.append(rk_vecs)
                     return a_vecs
 
@@ -549,18 +541,12 @@ def compile_wmma_mixed_preshuffle_gemm(
                                 + klane * arith.index(B_STRIDE_KLANE)
                                 + lane16 * arith.index(B_STRIDE_NLANE)
                             )
+                            # Load 8 bytes as dwordx2 (single buffer_load)
                             dword_off = byte_off // arith.index(4)
-                            b0 = buffer_ops.buffer_load(
-                                b_rsrc, dword_off, vec_width=1, dtype=i32
+                            b_raw = buffer_ops.buffer_load(
+                                b_rsrc, dword_off, vec_width=2, dtype=i32
                             )
-                            b1 = buffer_ops.buffer_load(
-                                b_rsrc,
-                                dword_off + arith.index(1),
-                                vec_width=1,
-                                dtype=i32,
-                            )
-                            b_vec = vector.from_elements(v2i32_ty, [b0, b1])
-                            rk_vecs.append(b_vec)
+                            rk_vecs.append(b_raw)
                         b_vecs.append(rk_vecs)
                     return b_vecs
 
@@ -724,16 +710,11 @@ def compile_wmma_mixed_preshuffle_gemm(
                             )
 
                             # Unpack int4 -> 8 bf16 values with dequant
-                            # packed_i32 contains 8 int4 values:
-                            # byte0: low_nibble=v0, high_nibble=v1
-                            # byte1: low_nibble=v2, high_nibble=v3
-                            # byte2: low_nibble=v4, high_nibble=v5
-                            # byte3: low_nibble=v6, high_nibble=v7
-                            # Dequant: float_val = (int4_val - 8) * scale
+                            # packed_i32 has 8 int4 values (nibbles)
+                            # Dequant: (uint4_val - 8) * scale = uint4_val * scale - 8 * scale
+                            # Pre-compute bias = -8.0 * scale (FMA-friendly)
+                            bias = arith.constant(-8.0, type=f32) * scale_val
 
-                            c_zero_pt = arith.constant(8.0, type=f32)
-
-                            # Extract each nibble, convert to f32, dequant, then to bf16
                             bf16_vals = []
                             for ni in range_constexpr(8):
                                 byte_idx = ni // 2
@@ -746,8 +727,9 @@ def compile_wmma_mixed_preshuffle_gemm(
                                     arith.shrui(packed_i32, shift),
                                     arith.constant(0xF, type=i32),
                                 )
-                                nibble_f32 = arith.sitofp(f32, nibble)
-                                dequant_f32 = (nibble_f32 - c_zero_pt) * scale_val
+                                nibble_f32 = arith.uitofp(f32, nibble)
+                                # FMA: nibble * scale + bias
+                                dequant_f32 = nibble_f32 * scale_val + bias
                                 bf16_vals.append(arith.trunc_f(bf16, dequant_f32))
 
                             b_vec = vector.from_elements(v8bf16_ty, bf16_vals)
