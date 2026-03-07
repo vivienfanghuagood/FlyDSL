@@ -42,7 +42,9 @@ def _default_mlir_lib_dir() -> Optional[Path]:
             for cand in (embedded_lib_dir, embedded_lib_dir / "lib"):
                 if not cand.exists():
                     continue
-                if (cand / "libflir_jit_runtime.so").exists() or any(cand.glob("libflir_jit_runtime.so.*")):
+                if (cand / "libflir_jit_runtime.so").exists() or any(
+                    cand.glob("libflir_jit_runtime.so.*")
+                ):
                     return cand
     except Exception:
         pass
@@ -77,6 +79,28 @@ def default_shared_libs(lib_dir: Optional[Path] = None) -> SharedLibs:
     )
 
 
+_memref_desc_cache: Dict[int, type] = {}
+
+
+def _make_memref_desc_type(rank: int):
+    """Get (cached) ctypes Structure for a memref descriptor of the given rank."""
+    cached = _memref_desc_cache.get(rank)
+    if cached is not None:
+        return cached
+
+    class _MemRefDesc(ctypes.Structure):
+        _fields_ = [
+            ("allocated", ctypes.c_void_p),
+            ("aligned", ctypes.c_void_p),
+            ("offset", ctypes.c_int64),
+            ("sizes", ctypes.c_int64 * rank),
+            ("strides", ctypes.c_int64 * rank),
+        ]
+
+    _memref_desc_cache[rank] = _MemRefDesc
+    return _MemRefDesc
+
+
 class ExecutionEngineExecutor:
     """Execute host-side entrypoints compiled by FLIR via MLIR ExecutionEngine."""
 
@@ -93,8 +117,11 @@ class ExecutionEngineExecutor:
             shared_libs = default_shared_libs().as_list()
 
         self._llvm_sigs = self._extract_llvm_func_sigs(jit_module)
-        self.engine = ExecutionEngine(jit_module, opt_level=opt_level, shared_libs=list(shared_libs))
+        self.engine = ExecutionEngine(
+            jit_module, opt_level=opt_level, shared_libs=list(shared_libs)
+        )
         self.engine.initialize()
+        self._wrapper_cache: Dict[str, object] = {}  # cached wrappers
 
     @staticmethod
     def _extract_llvm_func_sigs(jit_module) -> Dict[str, List[str]]:
@@ -143,6 +170,11 @@ class ExecutionEngineExecutor:
         return ctypes.c_void_p
 
     def __getattr__(self, name: str):
+        # Check wrapper cache first
+        cached = self._wrapper_cache.get(name)
+        if cached is not None:
+            return cached
+
         # `ExecutionEngine.raw_lookup(name)` returns the packed-call interface,
         # i.e. a function pointer with signature `void(void**)`.
         sym = f"_mlir_ciface_{name}"
@@ -162,243 +194,393 @@ class ExecutionEngineExecutor:
         # Packed-call wrapper: void(void**)
         func_exe = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(func_ptr)
 
-        def wrapper(*args):
-            llvm_arg_tys = self._llvm_sigs.get(sig_name) or self._llvm_sigs.get(name) or []
-            if len(args) != len(llvm_arg_tys):
-                # Best-effort for 0-arg functions when signature couldn't be parsed.
-                if len(args) == 0 and len(llvm_arg_tys) == 0:
-                    empty = (ctypes.c_void_p * 0)()
-                    return func_exe(empty)
-                # Fallback: try to expand tensor-like args into flattened ranked memref ABI.
-                def _is_tensor_like(x) -> bool:
-                    return (
-                        hasattr(x, "data_ptr")
-                        and callable(getattr(x, "data_ptr"))
-                        and hasattr(x, "numel")
-                        and callable(getattr(x, "numel"))
-                        and hasattr(x, "is_contiguous")
-                        and callable(getattr(x, "is_contiguous"))
-                    )
-
-                def _tensor_rank(x) -> int:
-                    if hasattr(x, "dim") and callable(getattr(x, "dim")):
-                        try:
-                            return int(x.dim())
-                        except Exception:
-                            return 1
-                    if hasattr(x, "shape"):
-                        try:
-                            return int(len(x.shape))
-                        except Exception:
-                            return 1
-                    return 1
-
-                def _tensor_shape(x):
-                    try:
-                        return tuple(int(d) for d in x.shape)
-                    except Exception:
-                        return None
-
-                def _tensor_strides(x):
-                    if hasattr(x, "stride") and callable(getattr(x, "stride")):
-                        try:
-                            return tuple(int(s) for s in x.stride())
-                        except Exception:
-                            return None
-                    return None
-
-                def _try_expand_flattened_memrefs(user_args, sig_tys):
-                    out = []
-                    i = 0  # sig index
-                    j = 0  # user arg index
-                    while i < len(sig_tys) and j < len(user_args):
-                        # Detect start of a flattened memref descriptor.
+        # Pre-compute ciface descriptor state (once, not per call)
+        llvm_arg_tys = self._llvm_sigs.get(sig_name) or self._llvm_sigs.get(name) or []
+        is_ciface = sig_name.startswith("_mlir_ciface_")
+        raw_sig = self._llvm_sigs.get(name, [])
+        ciface_sig = self._llvm_sigs.get(sig_name, [])
+        ciface_uses_desc_ptrs = bool(
+            is_ciface and raw_sig and ciface_sig and len(raw_sig) > len(ciface_sig)
+        )
+        memref_ranks: List[int] = []
+        if ciface_uses_desc_ptrs:
+            scalar_count = sum(1 for t in ciface_sig if t.strip() != "!llvm.ptr")
+            memref_count = sum(1 for t in ciface_sig if t.strip() == "!llvm.ptr")
+            idx = 0
+            for mi in range(memref_count):
+                if (
+                    idx + 2 >= len(raw_sig)
+                    or raw_sig[idx].strip() != "!llvm.ptr"
+                    or raw_sig[idx + 1].strip() != "!llvm.ptr"
+                    or raw_sig[idx + 2].strip() != "i64"
+                ):
+                    memref_ranks = []
+                    break
+                if mi < memref_count - 1:
+                    nxt = idx + 3
+                    while nxt + 2 < len(raw_sig):
                         if (
-                            _is_tensor_like(user_args[j])
-                            and i + 2 < len(sig_tys)
-                            and sig_tys[i].strip() == "!llvm.ptr"
-                            and sig_tys[i + 1].strip() == "!llvm.ptr"
-                            and sig_tys[i + 2].strip() == "i64"
+                            raw_sig[nxt].strip() == "!llvm.ptr"
+                            and raw_sig[nxt + 1].strip() == "!llvm.ptr"
+                            and raw_sig[nxt + 2].strip() == "i64"
                         ):
-                            # How many consecutive i64s after the first 3?
-                            k = i + 3
-                            num_i64 = 0
-                            while k < len(sig_tys) and sig_tys[k].strip() == "i64":
-                                num_i64 += 1
-                                k += 1
-                            # Need an even number: sizes+strides.
-                            if num_i64 < 2 or (num_i64 % 2) != 0:
-                                return None
-                            max_rank = num_i64 // 2
-                            r = _tensor_rank(user_args[j])
-                            if r < 1 or r > max_rank:
-                                # Fall back to rank-1 if available.
-                                if max_rank >= 1:
-                                    r = 1
-                                else:
-                                    return None
-                            span = 3 + 2 * r
+                            break
+                        nxt += 1
+                    d = nxt - (idx + 3)
+                    memref_ranks.append(max(1, d // 2) if d >= 2 and d % 2 == 0 else 1)
+                    idx = nxt
+                else:
+                    d = (len(raw_sig) - scalar_count) - (idx + 3)
+                    memref_ranks.append(max(1, d // 2) if d >= 2 and d % 2 == 0 else 1)
 
-                            t = user_args[j]
-                            if not bool(t.is_contiguous()):
-                                raise ValueError("Non-contiguous tensor passed to memref arg; call `.contiguous()` first.")
-                            base = int(t.data_ptr())
-                            out.append(ctypes.c_void_p(base))  # allocated
-                            out.append(ctypes.c_void_p(base))  # aligned
-                            out.append(int(0))                 # offset (elements)
+        # Pre-strip type strings
+        stripped_tys = [ty.strip() for ty in llvm_arg_tys]
+        n_args = len(stripped_tys)
 
-                            if r == 1:
-                                out.append(int(t.numel()))
-                                out.append(int(1))
-                            else:
-                                shape = _tensor_shape(t)
-                                strides = _tensor_strides(t)
-                                if shape is None or strides is None or len(shape) < r or len(strides) < r:
-                                    return None
-                                # Use the last r dims/strides (supports passing a flattened view tensor too).
-                                shape_r = tuple(int(d) for d in shape[-r:])
-                                strides_r = tuple(int(s) for s in strides[-r:])
-                                out.extend(list(shape_r))
-                                out.extend(list(strides_r))
+        # Pre-compute per-argument metadata for the fast path
+        # arg_kind: 0 = memref desc ptr, 1 = tensor data_ptr, 2 = scalar
+        arg_kinds: List[int] = []
+        arg_memref_ranks: List[int] = []  # only meaningful for kind==0
+        arg_ctypes: List[type] = []  # only meaningful for kind==2
+        memref_i = 0
+        for ty in stripped_tys:
+            if ty == "!llvm.ptr":
+                if (
+                    ciface_uses_desc_ptrs
+                    and memref_ranks
+                    and memref_i < len(memref_ranks)
+                ):
+                    arg_kinds.append(0)  # memref descriptor
+                    arg_memref_ranks.append(int(memref_ranks[memref_i]))
+                    arg_ctypes.append(ctypes.c_void_p)
+                    memref_i += 1
+                else:
+                    arg_kinds.append(1)  # tensor data_ptr
+                    arg_memref_ranks.append(0)
+                    arg_ctypes.append(ctypes.c_void_p)
+            else:
+                arg_kinds.append(2)  # scalar
+                arg_memref_ranks.append(0)
+                arg_ctypes.append(self._ctype_for_llvm_type(ty))
 
-                            i += span
-                            j += 1
-                            continue
+        # Pre-create the c_args array type
+        c_args_type = ctypes.c_void_p * n_args
 
-                        # Default: 1:1 mapping (scalar or pointer)
-                        out.append(user_args[j])
-                        i += 1
-                        j += 1
+        # Pre-resolve memref descriptor types
+        desc_types: List[type] = []
+        for r in arg_memref_ranks:
+            if r > 0:
+                desc_types.append(_make_memref_desc_type(r))
+            else:
+                desc_types.append(type(None))
 
-                    if i == len(sig_tys) and j == len(user_args):
-                        return out
-                    return None
-
-                expanded = _try_expand_flattened_memrefs(args, llvm_arg_tys)
-                if expanded is None:
-                    raise TypeError(f"{name} expects {len(llvm_arg_tys)} args, got {len(args)}")
-                args = tuple(expanded)
+        def wrapper(*args):
+            if len(args) != n_args:
+                # Slow path: try to expand tensor-like args into flattened ranked memref ABI
+                return self._slow_dispatch(func_exe, name, sig_name, args)
 
             owned = []  # keep ctypes temporaries alive for the duration of the call
             arg_ptrs = []
 
-            # If we're calling a ciface wrapper and the raw function uses a flattened
-            # memref ABI, then the ciface `!llvm.ptr` arguments are *pointers to
-            # memref descriptors*, not raw data pointers.
-            #
-            # We infer each memref rank from the raw signature and build a matching
-            # descriptor from the torch tensor argument.
-            is_ciface = sig_name.startswith("_mlir_ciface_")
-            raw_sig = self._llvm_sigs.get(name, [])
-            ciface_sig = self._llvm_sigs.get(sig_name, [])
-            ciface_uses_desc_ptrs = bool(is_ciface and raw_sig and ciface_sig and len(raw_sig) > len(ciface_sig))
-            memref_ranks = []
-            if ciface_uses_desc_ptrs:
-                # Number of scalar (non-ptr) args in ciface.
-                scalar_count = sum(1 for t in ciface_sig if t.strip() != "!llvm.ptr")
-                # Number of memref descriptor pointers in ciface.
-                memref_count = sum(1 for t in ciface_sig if t.strip() == "!llvm.ptr")
-                idx = 0
-                for mi in range(memref_count):
-                    if idx + 2 >= len(raw_sig) or raw_sig[idx].strip() != "!llvm.ptr" or raw_sig[idx + 1].strip() != "!llvm.ptr" or raw_sig[idx + 2].strip() != "i64":
-                        # Best-effort fallback.
-                        memref_ranks = []
-                        break
-                    if mi < memref_count - 1:
-                        # Find next memref descriptor start.
-                        nxt = idx + 3
-                        while nxt + 2 < len(raw_sig):
-                            if raw_sig[nxt].strip() == "!llvm.ptr" and raw_sig[nxt + 1].strip() == "!llvm.ptr" and raw_sig[nxt + 2].strip() == "i64":
-                                break
-                            nxt += 1
-                        d = nxt - (idx + 3)
-                        memref_ranks.append(max(1, d // 2) if d >= 2 and d % 2 == 0 else 1)
-                        idx = nxt
+            for i in range(n_args):
+                a = args[i]
+                kind = arg_kinds[i]
+
+                if kind == 0:
+                    # Memref descriptor path
+                    r = arg_memref_ranks[i]
+                    base = int(a.data_ptr())
+                    DescT = desc_types[i]
+                    desc = DescT()
+                    desc.allocated = base
+                    desc.aligned = base
+                    desc.offset = 0
+                    if r == 1:
+                        desc.sizes[0] = int(a.numel())
+                        desc.strides[0] = 1
                     else:
-                        # Last memref: remaining (excluding trailing scalars) encodes sizes+strides.
-                        d = (len(raw_sig) - scalar_count) - (idx + 3)
-                        memref_ranks.append(max(1, d // 2) if d >= 2 and d % 2 == 0 else 1)
+                        shape = a.shape
+                        stride = a.stride()
+                        for ii in range(r):
+                            desc.sizes[ii] = int(shape[ii - r])
+                            desc.strides[ii] = int(stride[ii - r])
+                    owned.append(desc)
+                    desc_ptr = ctypes.c_void_p(ctypes.addressof(desc))
+                    owned.append(desc_ptr)
+                    arg_ptrs.append(
+                        ctypes.cast(ctypes.pointer(desc_ptr), ctypes.c_void_p)
+                    )
 
-            def _make_memref_desc_type(rank: int):
-                class _MemRefDesc(ctypes.Structure):
-                    _fields_ = [
-                        ("allocated", ctypes.c_void_p),
-                        ("aligned", ctypes.c_void_p),
-                        ("offset", ctypes.c_int64),
-                        ("sizes", ctypes.c_int64 * rank),
-                        ("strides", ctypes.c_int64 * rank),
-                    ]
-                return _MemRefDesc
-
-            memref_i = 0
-            for a, ty in zip(args, llvm_arg_tys):
-                ty = ty.strip()
-                if ty == "!llvm.ptr":
-                    # Tensor-like: any object with a `.data_ptr()` method returning an int.
-                    if hasattr(a, "data_ptr") and callable(getattr(a, "data_ptr")):
-                        if ciface_uses_desc_ptrs and memref_ranks and memref_i < len(memref_ranks):
-                            r = int(memref_ranks[memref_i])
-                            memref_i += 1
-                            if hasattr(a, "is_contiguous") and callable(getattr(a, "is_contiguous")) and not bool(a.is_contiguous()):
-                                raise ValueError("Non-contiguous tensor passed to memref argument; call `.contiguous()` first.")
-                            base = int(a.data_ptr())
-                            # Shape/stride in elements.
-                            shape = tuple(int(d) for d in getattr(a, "shape", (int(a.numel()),)))
-                            stride = tuple(int(s) for s in a.stride()) if hasattr(a, "stride") and callable(getattr(a, "stride")) else (1,)
-                            if r == 1:
-                                sizes = (int(a.numel()),)
-                                strides = (1,)
-                            else:
-                                # Use the last r dims (row-major torch contiguous expected).
-                                sizes = shape[-r:]
-                                strides = stride[-r:]
-                            DescT = _make_memref_desc_type(r)
-                            desc = DescT()
-                            desc.allocated = ctypes.c_void_p(base)
-                            desc.aligned = ctypes.c_void_p(base)
-                            desc.offset = ctypes.c_int64(0)
-                            for ii in range(r):
-                                desc.sizes[ii] = int(sizes[ii])
-                                desc.strides[ii] = int(strides[ii])
-                            owned.append(desc)
-                            # IMPORTANT: packed-call expects a pointer to the *argument value*.
-                            # For `!llvm.ptr` args, the argument value is itself a pointer,
-                            # so we must pass a pointer-to-(c_void_p) holding `&desc`, not
-                            # a pointer-to-struct.
-                            desc_ptr = ctypes.c_void_p(ctypes.addressof(desc))
-                            owned.append(desc_ptr)
-                            arg_ptrs.append(ctypes.cast(ctypes.pointer(desc_ptr), ctypes.c_void_p))
-                            continue
-
+                elif kind == 1:
+                    # Tensor data_ptr path
+                    if hasattr(a, "data_ptr"):
                         v = ctypes.c_void_p(int(a.data_ptr()))
-                    elif isinstance(a, ctypes.c_void_p):
-                        v = a
                     elif isinstance(a, int):
                         v = ctypes.c_void_p(int(a))
                     else:
-                        raise TypeError(f"Unsupported pointer arg type: {type(a)}")
+                        v = (
+                            a
+                            if isinstance(a, ctypes.c_void_p)
+                            else ctypes.c_void_p(int(a))
+                        )
+                    owned.append(v)
+                    arg_ptrs.append(ctypes.cast(ctypes.pointer(v), ctypes.c_void_p))
+
                 else:
-                    cty = self._ctype_for_llvm_type(ty)
-                    if isinstance(a, bool):
-                        v = cty(bool(a))
+                    # Scalar path
+                    cty = arg_ctypes[i]
+                    if isinstance(a, float):
+                        v = cty(a)
                     elif isinstance(a, int):
                         v = cty(int(a))
-                    elif isinstance(a, float):
-                        v = cty(float(a))
+                    elif isinstance(a, bool):
+                        v = cty(bool(a))
                     else:
-                        raise TypeError(f"Unsupported scalar arg type: {type(a)} for {ty}")
+                        v = cty(a)
+                    owned.append(v)
+                    arg_ptrs.append(ctypes.cast(ctypes.pointer(v), ctypes.c_void_p))
 
-                owned.append(v)
-                arg_ptrs.append(ctypes.cast(ctypes.pointer(v), ctypes.c_void_p))
-
-            c_args = (ctypes.c_void_p * len(arg_ptrs))(*arg_ptrs)
+            c_args = c_args_type(*arg_ptrs)
             owned.append(c_args)
             return func_exe(c_args)
 
+        # Cache the wrapper for subsequent calls
+        self._wrapper_cache[name] = wrapper
         return wrapper
 
+    def _slow_dispatch(self, func_exe, name, sig_name, args):
+        """Slow path for arg-count mismatch (e.g. auto-expanding tensors)."""
+        llvm_arg_tys = self._llvm_sigs.get(sig_name) or self._llvm_sigs.get(name) or []
+
+        if len(args) == 0 and len(llvm_arg_tys) == 0:
+            empty = (ctypes.c_void_p * 0)()
+            return func_exe(empty)
+
+        def _is_tensor_like(x) -> bool:
+            return (
+                hasattr(x, "data_ptr")
+                and callable(getattr(x, "data_ptr"))
+                and hasattr(x, "numel")
+                and callable(getattr(x, "numel"))
+                and hasattr(x, "is_contiguous")
+                and callable(getattr(x, "is_contiguous"))
+            )
+
+        def _tensor_rank(x) -> int:
+            if hasattr(x, "dim") and callable(getattr(x, "dim")):
+                try:
+                    return int(x.dim())
+                except Exception:
+                    return 1
+            if hasattr(x, "shape"):
+                try:
+                    return int(len(x.shape))
+                except Exception:
+                    return 1
+            return 1
+
+        def _tensor_shape(x):
+            try:
+                return tuple(int(d) for d in x.shape)
+            except Exception:
+                return None
+
+        def _tensor_strides(x):
+            if hasattr(x, "stride") and callable(getattr(x, "stride")):
+                try:
+                    return tuple(int(s) for s in x.stride())
+                except Exception:
+                    return None
+            return None
+
+        def _try_expand_flattened_memrefs(user_args, sig_tys):
+            out = []
+            i = 0
+            j = 0
+            while i < len(sig_tys) and j < len(user_args):
+                if (
+                    _is_tensor_like(user_args[j])
+                    and i + 2 < len(sig_tys)
+                    and sig_tys[i].strip() == "!llvm.ptr"
+                    and sig_tys[i + 1].strip() == "!llvm.ptr"
+                    and sig_tys[i + 2].strip() == "i64"
+                ):
+                    k = i + 3
+                    num_i64 = 0
+                    while k < len(sig_tys) and sig_tys[k].strip() == "i64":
+                        num_i64 += 1
+                        k += 1
+                    if num_i64 < 2 or (num_i64 % 2) != 0:
+                        return None
+                    max_rank = num_i64 // 2
+                    r = _tensor_rank(user_args[j])
+                    if r < 1 or r > max_rank:
+                        if max_rank >= 1:
+                            r = 1
+                        else:
+                            return None
+                    span = 3 + 2 * r
+                    t = user_args[j]
+                    if not bool(t.is_contiguous()):
+                        raise ValueError(
+                            "Non-contiguous tensor passed to memref arg; call `.contiguous()` first."
+                        )
+                    base = int(t.data_ptr())
+                    out.append(ctypes.c_void_p(base))
+                    out.append(ctypes.c_void_p(base))
+                    out.append(int(0))
+                    if r == 1:
+                        out.append(int(t.numel()))
+                        out.append(int(1))
+                    else:
+                        shape = _tensor_shape(t)
+                        strides = _tensor_strides(t)
+                        if (
+                            shape is None
+                            or strides is None
+                            or len(shape) < r
+                            or len(strides) < r
+                        ):
+                            return None
+                        shape_r = tuple(int(d) for d in shape[-r:])
+                        strides_r = tuple(int(s) for s in strides[-r:])
+                        out.extend(list(shape_r))
+                        out.extend(list(strides_r))
+                    i += span
+                    j += 1
+                    continue
+                out.append(user_args[j])
+                i += 1
+                j += 1
+            if i == len(sig_tys) and j == len(user_args):
+                return out
+            return None
+
+        expanded = _try_expand_flattened_memrefs(args, llvm_arg_tys)
+        if expanded is None:
+            raise TypeError(f"{name} expects {len(llvm_arg_tys)} args, got {len(args)}")
+        args = tuple(expanded)
+
+        owned = []
+        arg_ptrs = []
+
+        is_ciface = sig_name.startswith("_mlir_ciface_")
+        raw_sig = self._llvm_sigs.get(name, [])
+        ciface_sig = self._llvm_sigs.get(sig_name, [])
+        ciface_uses_desc_ptrs = bool(
+            is_ciface and raw_sig and ciface_sig and len(raw_sig) > len(ciface_sig)
+        )
+        memref_ranks: List[int] = []
+        if ciface_uses_desc_ptrs:
+            scalar_count = sum(1 for t in ciface_sig if t.strip() != "!llvm.ptr")
+            memref_count = sum(1 for t in ciface_sig if t.strip() == "!llvm.ptr")
+            idx = 0
+            for mi in range(memref_count):
+                if (
+                    idx + 2 >= len(raw_sig)
+                    or raw_sig[idx].strip() != "!llvm.ptr"
+                    or raw_sig[idx + 1].strip() != "!llvm.ptr"
+                    or raw_sig[idx + 2].strip() != "i64"
+                ):
+                    memref_ranks = []
+                    break
+                if mi < memref_count - 1:
+                    nxt = idx + 3
+                    while nxt + 2 < len(raw_sig):
+                        if (
+                            raw_sig[nxt].strip() == "!llvm.ptr"
+                            and raw_sig[nxt + 1].strip() == "!llvm.ptr"
+                            and raw_sig[nxt + 2].strip() == "i64"
+                        ):
+                            break
+                        nxt += 1
+                    d = nxt - (idx + 3)
+                    memref_ranks.append(max(1, d // 2) if d >= 2 and d % 2 == 0 else 1)
+                    idx = nxt
+                else:
+                    d = (len(raw_sig) - scalar_count) - (idx + 3)
+                    memref_ranks.append(max(1, d // 2) if d >= 2 and d % 2 == 0 else 1)
+
+        memref_i = 0
+        for a, ty in zip(args, llvm_arg_tys):
+            ty = ty.strip()
+            if ty == "!llvm.ptr":
+                if hasattr(a, "data_ptr") and callable(getattr(a, "data_ptr")):
+                    if (
+                        ciface_uses_desc_ptrs
+                        and memref_ranks
+                        and memref_i < len(memref_ranks)
+                    ):
+                        r = int(memref_ranks[memref_i])
+                        memref_i += 1
+                        if (
+                            hasattr(a, "is_contiguous")
+                            and callable(getattr(a, "is_contiguous"))
+                            and not bool(a.is_contiguous())
+                        ):
+                            raise ValueError(
+                                "Non-contiguous tensor passed to memref argument; call `.contiguous()` first."
+                            )
+                        base = int(a.data_ptr())
+                        shape = tuple(
+                            int(d) for d in getattr(a, "shape", (int(a.numel()),))
+                        )
+                        stride = (
+                            tuple(int(s) for s in a.stride())
+                            if hasattr(a, "stride") and callable(getattr(a, "stride"))
+                            else (1,)
+                        )
+                        if r == 1:
+                            sizes = (int(a.numel()),)
+                            strides = (1,)
+                        else:
+                            sizes = shape[-r:]
+                            strides = stride[-r:]
+                        DescT = _make_memref_desc_type(r)
+                        desc = DescT()
+                        desc.allocated = ctypes.c_void_p(base)
+                        desc.aligned = ctypes.c_void_p(base)
+                        desc.offset = ctypes.c_int64(0)
+                        for ii in range(r):
+                            desc.sizes[ii] = int(sizes[ii])
+                            desc.strides[ii] = int(strides[ii])
+                        owned.append(desc)
+                        desc_ptr = ctypes.c_void_p(ctypes.addressof(desc))
+                        owned.append(desc_ptr)
+                        arg_ptrs.append(
+                            ctypes.cast(ctypes.pointer(desc_ptr), ctypes.c_void_p)
+                        )
+                        continue
+                    v = ctypes.c_void_p(int(a.data_ptr()))
+                elif isinstance(a, ctypes.c_void_p):
+                    v = a
+                elif isinstance(a, int):
+                    v = ctypes.c_void_p(int(a))
+                else:
+                    raise TypeError(f"Unsupported pointer arg type: {type(a)}")
+            else:
+                cty = self._ctype_for_llvm_type(ty)
+                if isinstance(a, bool):
+                    v = cty(bool(a))
+                elif isinstance(a, int):
+                    v = cty(int(a))
+                elif isinstance(a, float):
+                    v = cty(float(a))
+                else:
+                    raise TypeError(f"Unsupported scalar arg type: {type(a)} for {ty}")
+            owned.append(v)
+            arg_ptrs.append(ctypes.cast(ctypes.pointer(v), ctypes.c_void_p))
+
+        c_args = (ctypes.c_void_p * len(arg_ptrs))(*arg_ptrs)
+        owned.append(c_args)
+        return func_exe(c_args)
+
     def __call__(self, *args):
-        return self.__getattr__("__call__")(*args)
+        # Use cached wrapper via __getattr__ (only resolved once)
+        fn = self._wrapper_cache.get("__call__")
+        if fn is None:
+            fn = self.__getattr__("__call__")
+        return fn(*args)
 
 
 Executor = ExecutionEngineExecutor
