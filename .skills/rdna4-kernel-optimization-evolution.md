@@ -6,6 +6,31 @@ The FlyDSL repository contains 26+ iterations of WMMA GEMM kernels for gfx1201,
 evolving from a basic implementation to 134+ TFLOPS. This skill captures the
 key optimization lessons and decision points.
 
+## Kernel File Index
+
+| Kernel | File | Peak Performance | Description |
+|---|---|---|---|
+| GEMM v1-v26 | `kernels/wmma_gemm.py` .. `kernels/wmma_gemm_v26.py` | 134 TFLOPS (v15+) | Iterative WMMA GEMM evolution |
+| Preshuffle GEMM | `kernels/wmma_preshuffle_gemm.py` | 136 TFLOPS (112% rocBLAS) | No-LDS preshuffle GEMM, production |
+| MoE GEMM | `kernels/wmma_moe_gemm.py` | — | Two-stage MoE (gate+up SiLU, down) |
+| Mixed-Prec GEMM | `kernels/wmma_mixed_preshuffle_gemm.py` | 249 TFLOPS (fp8, 103% rocBLAS) | fp8+fp8, bf16+fp8, bf16+int4 paths |
+| W4A16 GEMV | `kernels/wmma_w4a16_gemv.py` | — | INT4 weight-only GEMV for decode |
+| Decode Attn (WMMA) | `kernels/wmma_decode_attention.py` | 25us BS=1 KV=256 | WMMA Q@K^T + elem P@V, single WG |
+| Decode Attn (Split-KV) | `kernels/wmma_decode_attention_splitkv.py` | 38us BS=1 KV=1024 | Two-stage split-KV for large KV |
+| Decode Attn (Elem) | `kernels/wmma_decode_attention_elemwise.py` | 27us BS=1 KV=256 | No-WMMA reference implementation |
+
+### Related Skills Files
+
+| Skill | Coverage |
+|---|---|
+| `rdna4-gemm-kernel-patterns.md` | GEMM design patterns (LDS, preshuffle, inline ASM) |
+| `rdna4-wmma-register-layout.md` | WMMA lane mapping, preshuffle layout |
+| `rdna4-buffer-ops-and-memory.md` | Buffer load/store, LDS, memory coalescing |
+| `rdna4-mixed-precision-quantization.md` | FP8, INT4, W4A16, MoE patterns |
+| `rdna4-attention-kernel.md` | Decode attention (3 approaches, perf results) |
+| `rdna4-flydsl-kernel-skeleton.md` | FlyDSL API reference, kernel template |
+| `rdna4-dispatch-and-benchmarking.md` | Dispatch overhead fix, benchmarking methodology |
+
 ## Evolution Summary
 
 ### v1 (Baseline): LDS-based A and B with inline ASM LDS reads
@@ -156,6 +181,48 @@ memref.store(val, C, [row, col])
 # Good: buffer_store (generates buffer_store_*, hardware coalescing)
 buffer_ops.buffer_store(val, c_rsrc, row * N + col)
 ```
+
+## Phase 6: FlashAttention Decode (3 Approaches, 1 Runtime Fix)
+
+### Approach A: Full WMMA (Q@K^T + P@V via WMMA) -- CORRECT BUT SLOW
+- Used WMMA for both Q@K^T and P@V
+- **Problem**: P@V required staging V through LDS (512 scalar LDS reads per block)
+- LDS staging overhead negated WMMA benefit
+- Bugs found: V LDS shared across waves (data race), output LDS mapping mismatch,
+  klane=0/klane=1 write race (fixed with XOR shuffle)
+- Performance: same as scalar (~80us, dispatch-bound)
+
+### Approach B: Hybrid WMMA Q@K^T + Element-wise P@V -- BEST SINGLE-KERNEL
+- WMMA for Q@K^T (efficient 16-token score computation)
+- Element-wise P@V (each thread handles 4 V elements, no LDS needed)
+- **25us GPU time at BS=1 KV=256** (after dispatch fix)
+- File: `kernels/wmma_decode_attention.py`
+
+### Approach C: Split-KV (Two-Stage) -- BEST FOR LARGE KV
+- Stage 1: parallel KV splits, each split computes partial softmax
+- Stage 2: merge across splits using log-sum-exp rescaling
+- **38us at BS=1 KV=1024** (constant regardless of KV within split capacity)
+- File: `kernels/wmma_decode_attention_splitkv.py`
+
+### Approach D: Pure Element-wise (No WMMA) -- REFERENCE ONLY
+- Wave-level dot products with 5-round shuffle reduction for Q@K^T
+- Slightly slower than WMMA hybrid (27us vs 25us at KV=256)
+- Confirmed WMMA provides ~10% benefit for Q@K^T at this scale
+- File: `kernels/wmma_decode_attention_elemwise.py`
+
+### Critical Discovery: Dispatch Overhead
+- All approaches showed identical ~80us floor before fix
+- Root cause: FlyDSL executor rebuilt wrapper closure on every `exe()` call (71us)
+- Fix: cache wrappers, memoize ctypes structures, pre-compute arg metadata
+- After fix: 18us dispatch (2.6x faster than Triton's 48us)
+- **Lesson**: Always measure dispatch separately; GPU compute can be hidden by CPU overhead
+
+### Key Optimization Lesson
+For decode attention (single query), the choice between WMMA and element-wise for
+Q@K^T is minor (~10% difference). The dominant factors are:
+1. **Dispatch overhead** (18-48us, dominates at small BS/KV)
+2. **Parallelism strategy** (single WG vs split-KV, determines scaling)
+3. **P@V approach** (element-wise always beats WMMA for P@V due to LDS staging cost)
 
 ## Performance Profiling Tips
 

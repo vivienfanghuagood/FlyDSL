@@ -277,6 +277,69 @@ _apply_waves_per_eu_hint(m.module, waves_per_eu=2)  # 1-4 typical
 exe = flydsl.compile(m)
 ```
 
+## Wave-Level Shuffle Operations
+
+Cross-lane communication within a wave (no LDS needed):
+
+```python
+from flydsl.dialects.ext import gpu
+
+i32_type = ir.IntegerType.get_signless(32)
+
+# XOR shuffle: exchange values between lanes
+offset = arith.constant(16, type=i32_type)  # XOR with 16 = swap klane halves
+width = arith.constant(32, type=i32_type)   # full wave width
+shuf = gpu.ShuffleOp(
+    _unwrap(val),       # value to shuffle (must be raw MLIR Value)
+    _unwrap(offset),    # offset (raw MLIR Value)
+    _unwrap(width),     # width (raw MLIR Value)
+    mode="xor"          # "xor", "up", "down", "idx"
+)
+result = arith.ArithValue(shuf.shuffleResult)  # wrap back for arithmetic
+
+# Wave-level reduction (e.g., sum across 32 lanes):
+dot_val = local_sum
+for shift in [16, 8, 4, 2, 1]:
+    shift_val = arith.constant(shift, type=i32_type)
+    width_val = arith.constant(32, type=i32_type)
+    shuf = gpu.ShuffleOp(_unwrap(dot_val), _unwrap(shift_val), _unwrap(width_val), mode="xor")
+    dot_val = dot_val + arith.ArithValue(shuf.shuffleResult)
+# dot_val now has the sum in all lanes
+```
+
+## Two-Kernel (Multi-Stage) Patterns
+
+For split-KV attention or any two-stage computation:
+
+```python
+# Compile two separate modules
+class _Stage1(flir.MlirModule): ...
+class _Stage2(flir.MlirModule): ...
+exe_s1 = flydsl.compile(_Stage1())
+exe_s2 = flydsl.compile(_Stage2())
+
+# Call sequentially (same stream, implicit dependency)
+exe_s1(q, k, v, att_out, att_lse, ..., stream_ptr)
+exe_s2(att_out, att_lse, o, ..., stream_ptr)
+
+# Grid: stage1 has 3D grid (batch, heads, kv_splits)
+# Grid: stage2 has 2D grid (batch, heads)
+```
+
+## Math Operations
+
+```python
+from flydsl.dialects.ext import math as flydsl_math
+
+flydsl_math.exp2(arith.as_value(x))      # 2^x (fast, use for softmax)
+flydsl_math.exp(arith.as_value(x))       # e^x
+flydsl_math.log(arith.as_value(x))       # ln(x)
+
+# For softmax: exp(x) = exp2(x * log2(e))
+LOG2E = 1.4426950408889634
+exp_val = flydsl_math.exp2(arith.as_value(x * arith.constant(LOG2E, type=f32)))
+```
+
 ## Common Pitfalls
 
 1. **bf16 WMMA requires i16 bitcast**: Always bitcast v8bf16 -> v8i16 before WMMA
@@ -286,3 +349,10 @@ exe = flydsl.compile(m)
 5. **range_constexpr vs range()**: Use constexpr for small fixed counts, range() for dynamic
 6. **_unwrap() before raw MLIR ops**: ArithValue wrappers must be unwrapped for direct MLIR API
 7. **Wave size is 32**: Not 64 -- all thread indexing uses wave32 math
+8. **ShuffleOp args must be raw Values**: All 3 args to gpu.ShuffleOp must be _unwrap()'d
+9. **arith.cmpi does NOT exist**: Use Python operators (==, <, >) or arith.cmpu() for unsigned
+10. **Variables inside if in range() loops**: FlyDSL AST rewriter breaks when if-defined vars
+    are loop-carried. Use arith.select() instead of if/else inside range() loops
+11. **Dispatch overhead**: FlyDSL dispatch is ~18us after optimization. For latency-sensitive
+    kernels (<50us GPU time), dispatch overhead matters. Measure with no-sync timing.
+12. **f32 accumulation required**: Use wmma_f32_16x16x16_bf16, NOT bf16 accumulation variants

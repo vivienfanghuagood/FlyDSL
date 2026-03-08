@@ -6,6 +6,15 @@ This skill documents proven patterns for writing high-performance GEMM kernels o
 AMD RDNA4 (gfx1201) using WMMA instructions. These patterns have been validated
 to achieve 93-136 TFLOPS on Radeon hardware.
 
+### Kernel Files
+
+| File | Pattern | Performance |
+|---|---|---|
+| `kernels/wmma_gemm.py` .. `kernels/wmma_gemm_v26.py` | All patterns below (evolution) | 40-134 TFLOPS |
+| `kernels/wmma_preshuffle_gemm.py` | Pattern 2 (Preshuffle, production) | 136 TFLOPS (112% rocBLAS) |
+| `kernels/wmma_moe_gemm.py` | Two-stage MoE GEMM | See `rdna4-mixed-precision-quantization.md` |
+| `kernels/wmma_mixed_preshuffle_gemm.py` | Mixed-precision preshuffle | 249 TFLOPS fp8 (103% rocBLAS) |
+
 ## Architecture Constants
 
 ```

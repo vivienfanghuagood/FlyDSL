@@ -1,5 +1,12 @@
 # RDNA4 Buffer Operations and Memory Access Patterns
 
+These patterns are used across all WMMA kernels. Key examples:
+- GEMM cooperative loading: `kernels/wmma_preshuffle_gemm.py`, `kernels/wmma_gemm_v26.py`
+- Preshuffle direct loads: `kernels/wmma_preshuffle_gemm.py`, `kernels/wmma_mixed_preshuffle_gemm.py`
+- FP8 dwordx2 loads: `kernels/wmma_mixed_preshuffle_gemm.py`
+- INT4 nibble extraction: `kernels/wmma_w4a16_gemv.py`
+- Paged KV cache access: `kernels/wmma_decode_attention.py`, `kernels/wmma_decode_attention_splitkv.py`
+
 ## Buffer Resource Descriptors
 
 AMD GPUs use **buffer resource descriptors** for efficient memory access.

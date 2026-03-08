@@ -5,6 +5,14 @@
 RDNA4 supports several mixed-precision paths for inference optimization.
 This skill covers FP8, INT4 (W4A16), and mixed bf16+fp8 quantization patterns.
 
+### Kernel Files
+
+| File | Precision Paths | Description |
+|---|---|---|
+| `kernels/wmma_mixed_preshuffle_gemm.py` | fp8+fp8, bf16+fp8, bf16+int4 | Mixed-precision preshuffle GEMM (249T fp8) |
+| `kernels/wmma_w4a16_gemv.py` | bf16+int4 | W4A16 GEMV for decode (small-M) |
+| `kernels/wmma_moe_gemm.py` | bf16 (with SiLU) | Two-stage MoE GEMM |
+
 ## Precision Paths Summary
 
 | Path | A dtype | B dtype | WMMA Used | Use Case |

@@ -6,6 +6,11 @@ AMD RDNA4 (gfx12xx) GPUs use **Wave Matrix Multiply-Accumulate (WMMA)** instruct
 for accelerated matrix operations. These operate on **wave32** wavefronts (32 threads
 per wave), performing 16x16x16 matrix multiply-accumulate per instruction.
 
+All kernels in this project use these layouts:
+- BF16 WMMA: `kernels/wmma_preshuffle_gemm.py`, `kernels/wmma_decode_attention.py`
+- FP8 WMMA: `kernels/wmma_mixed_preshuffle_gemm.py`
+- Preshuffle layout: `kernels/wmma_preshuffle_gemm.py`, `kernels/wmma_mixed_preshuffle_gemm.py`
+
 ## Instruction Variants
 
 | Instruction | Input A | Input B | Accumulator | Notes |
