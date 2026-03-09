@@ -1,7 +1,8 @@
 # RDNA4 Kernel Development Guide
 
-Step-by-step workflow for developing new GPU kernels using FlyDSL on RDNA4 (gfx1201).
-This guide tells you **which skills to consult** and **what to do** at each stage.
+**Purpose**: Drive an agent through the full lifecycle of writing, verifying, profiling,
+and optimizing a GPU kernel using FlyDSL. The agent must produce a **Correctness Report**
+and an **Optimization Report** documenting every effort and result.
 
 ---
 
@@ -10,10 +11,10 @@ This guide tells you **which skills to consult** and **what to do** at each stag
 | Skill File | What It Covers | When to Use |
 |---|---|---|
 | `flydsl-api-dictionary.md` | All FlyDSL functions/classes with signatures and examples | Every kernel — the primary API reference |
-| `rdna4-flydsl-kernel-skeleton.md` | Complete boilerplate template (MlirModule, @kernel, @jit, LaunchFuncOp) | Starting any new kernel |
+| `rdna4-flydsl-kernel-skeleton.md` | Complete boilerplate (MlirModule, @kernel, @jit, LaunchFuncOp), common pitfalls | Starting any new kernel |
 | `rdna4-wmma-register-layout.md` | WMMA lane mapping, operand register layout, bf16/fp8 bitcast rules | Any kernel using WMMA/matrix ops |
 | `rdna4-gemm-kernel-patterns.md` | 4 proven GEMM patterns (LDS-based, preshuffle, inline ASM) | GEMM/matmul kernels |
-| `rdna4-buffer-ops-and-memory.md` | Buffer descriptors, load/store patterns, LDS, bank conflicts | Any kernel doing global/shared memory access |
+| `rdna4-buffer-ops-and-memory.md` | Buffer descriptors, load/store, LDS, bank conflicts, coalescing | Any kernel doing memory access |
 | `rdna4-mixed-precision-quantization.md` | INT4 W4A16, FP8, dequantization, per-group scaling | Quantized inference kernels |
 | `rdna4-moe-gemm-kernel.md` | Token routing, expert dispatch, SiLU, two-stage MoE | MoE/expert kernels |
 | `rdna4-attention-kernel.md` | Decode attention (WMMA hybrid, Split-KV, element-wise), online softmax | Attention kernels |
@@ -25,182 +26,97 @@ This guide tells you **which skills to consult** and **what to do** at each stag
 ## Workflow Overview
 
 ```
-1. Understand the Problem   →  What computation? What shapes? What precision?
-2. Choose Kernel Pattern    →  Match to an existing pattern or design a new one
-3. Write the Kernel         →  Use skeleton + API dictionary
-4. Write Correctness Test   →  Reference in float32, tolerance-based comparison
-5. Run & Debug              →  Fix compilation errors, verify correctness
-6. Benchmark                →  Measure TFLOPS, compare to baselines
-7. Optimize                 →  Apply optimization principles, iterate
+Phase 1: Design & Implement ─── Write the kernel, get it compiling
+Phase 2: Correctness         ─── Verify against reference, produce Correctness Report
+Phase 3: Profile & Analyze   ─── Measure perf, roofline analysis, identify bottleneck
+Phase 4: Optimize (loop)     ─── Apply targeted fix → re-profile → record result
+Phase 5: Final Report        ─── Deliver Correctness Report + Optimization Report
 ```
 
----
-
-## Step 1: Understand the Problem
-
-Before writing any code, determine:
-
-- **Computation**: matmul, attention, elementwise, reduction, etc.
-- **Shapes**: M, N, K dimensions; batch size; sequence length
-- **Precision**: bf16, fp8, int4 (W4A16), mixed
-- **Memory access pattern**: is data contiguous? preshuffled? paged?
-- **Latency vs throughput**: small problem (decode) or large (prefill)?
+The agent MUST track every optimization attempt and its measured impact.
 
 ---
 
-## Step 2: Choose Kernel Pattern
+## Phase 1: Design & Implement
 
-Match your problem to a known pattern:
+### 1.1 Understand the problem
 
-### GEMM / Matrix Multiply
-- **Skills**: `rdna4-gemm-kernel-patterns.md`, `rdna4-wmma-register-layout.md`
-- **Reference kernels**: `kernels/wmma_preshuffle_gemm.py`, `kernels/wmma_gemm_v26.py`
-- **Key decisions**: LDS-based vs preshuffle, tile sizes, double buffering
+Determine before writing code:
 
-### Attention (Decode)
-- **Skills**: `rdna4-attention-kernel.md`, `rdna4-wmma-register-layout.md`
-- **Reference kernels**: `kernels/wmma_decode_attention.py`
-- **Key decisions**: WMMA hybrid vs element-wise for P@V, split-KV for long sequences
-
-### Quantized Inference (W4A16, FP8)
-- **Skills**: `rdna4-mixed-precision-quantization.md`, `rdna4-wmma-register-layout.md`
-- **Reference kernels**: `kernels/wmma_w4a16_gemv.py`, `kernels/wmma_mixed_preshuffle_gemm.py`
-- **Key decisions**: dequant inline vs precompute, group size, GEMM vs GEMV
-
-### MoE (Mixture of Experts)
-- **Skills**: `rdna4-moe-gemm-kernel.md`, `rdna4-gemm-kernel-patterns.md`
-- **Reference kernels**: `kernels/wmma_moe_gemm.py`
-- **Key decisions**: two-stage vs single-stage, token routing, SiLU fusion
-
-### Elementwise / Reduction / Other
-- **Skills**: `flydsl-api-dictionary.md` (arith, vector, scf, gpu sections)
-- **Reference kernels**: `tests/kernels/test_eltwise_add.py`, `tests/kernels/test_softmax.py`, `tests/kernels/test_layernorm.py`
-- **Key decisions**: threads per element, vectorization width, shared memory for reductions
-
----
-
-## Step 3: Write the Kernel
-
-### 3a. Start from the skeleton
-
-**Skill**: `rdna4-flydsl-kernel-skeleton.md`
-
-Copy the template and fill in:
-1. Module name, GPU targets
-2. Kernel arguments (memrefs, scalars)
-3. Thread/block index computation
-4. Buffer resource creation
-5. Main computation loop
-6. Result stores
-7. `__call__` launcher with grid/block sizes
-
-### 3b. Look up API functions
-
-**Skill**: `flydsl-api-dictionary.md`
-
-This is the primary reference. Key sections by task:
-
-| Task | Dictionary Section |
+| Question | Why It Matters |
 |---|---|
-| Create constants, do arithmetic | Section 2 (arith) |
-| Load/store global memory | Section 3 (buffer_ops) |
-| Call WMMA instructions | Section 4 (rocdl) — WMMA subsection |
-| Vector manipulation (extract, bitcast) | Section 5 (vector) |
-| Loops and conditionals | Section 6 (scf) |
-| Thread IDs, barriers, shuffles | Section 7 (gpu) |
-| LDS (shared memory) access | Section 8 (memref) + Section 12 (SmemAllocator) |
-| Fast math (exp2, rcp) | Section 9 (llvm) — intrinsic calls |
-| Type constructors | Section 13 (Types / T) |
-| Compile and run | Section 14 (Compiler) |
+| What is the computation? (matmul, attention, reduction, ...) | Selects kernel pattern |
+| What are the shapes? (M, N, K, batch, seq_len) | Determines tile sizes, grid dimensions |
+| What precision? (bf16, fp8, int4, mixed) | Selects WMMA variant, data layout |
+| Is data preshuffled or row-major? | Determines memory access strategy |
+| Latency-sensitive or throughput? (decode vs prefill) | Drives grid size and dispatch concerns |
 
-### 3c. Handle WMMA specifics
+### 1.2 Select kernel pattern and skills
 
-**Skill**: `rdna4-wmma-register-layout.md`
-
-Critical rules:
-- bf16 operands must be bitcast to `v8i16` before WMMA
-- fp8 operands are `v2i32` (8 bytes packed as 2x i32)
-- Result is `v8f32` — extract with `vector.extract(acc, static_position=[i])`
-- Lane mapping: `lane16 = lane % 16`, `klane = lane // 16`
-
-### 3d. Handle memory access
-
-**Skill**: `rdna4-buffer-ops-and-memory.md`
-
-Key patterns:
-- `buffer_ops.create_buffer_resource()` for every tensor
-- Element offsets (API converts to bytes internally)
-- Predicated loads with `mask=` parameter
-- LDS via `SmemAllocator` + `memref.view` + `memref.load/store`
-
----
-
-## Step 4: Write Correctness Test
-
-### Test file structure
-
-Place tests in `tests/kernels/test_<kernel_name>.py`. Follow this pattern:
-
-```python
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-
-import torch
-from flydsl.runtime.device import get_rocm_arch
-from kernels.my_kernel import compile_my_kernel
-
-def reference_compute(A, B, ...):
-    """Reference implementation in float32."""
-    return (A.float() @ B.float()).to(torch.bfloat16)
-
-def test_correctness():
-    arch = get_rocm_arch()
-    if not arch.startswith("gfx12"):
-        pytest.skip("RDNA4 only")
-
-    torch.manual_seed(42)
-    # Small-magnitude inputs for numerical stability
-    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
-    B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda") * 0.1
-    C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
-
-    expected = reference_compute(A, B)
-
-    exe = compile_my_kernel(M=M, N=N, K=K)
-    exe(C, A, B, torch.cuda.current_stream().cuda_stream)
-    torch.cuda.synchronize()
-
-    # Check correctness
-    max_abs_err = (C.float() - expected.float()).abs().max().item()
-    rel_err = max_abs_err / (expected.float().abs().max().item() + 1e-8)
-    print(f"Relative error: {rel_err:.6f}")
-    assert rel_err < TOLERANCE, f"Relative error {rel_err} exceeds {TOLERANCE}"
+```
+What kind of kernel?
+│
+├─ Matrix multiply (GEMM)
+│  ├─ Large M,N,K (prefill)
+│  │   Skills: rdna4-gemm-kernel-patterns.md, rdna4-wmma-register-layout.md
+│  │   Ref:    kernels/wmma_preshuffle_gemm.py, kernels/wmma_gemm_v26.py
+│  ├─ Small M (decode GEMV)
+│  │   Skills: rdna4-mixed-precision-quantization.md
+│  │   Ref:    kernels/wmma_w4a16_gemv.py
+│  └─ MoE routing
+│      Skills: rdna4-moe-gemm-kernel.md, rdna4-gemm-kernel-patterns.md
+│      Ref:    kernels/wmma_moe_gemm.py
+│
+├─ Attention
+│  ├─ Decode (small Q)
+│  │   Skills: rdna4-attention-kernel.md, rdna4-wmma-register-layout.md
+│  │   Ref:    kernels/wmma_decode_attention.py
+│  └─ Prefill (large Q)
+│      Skills: rdna4-attention-kernel.md
+│
+├─ Quantized inference
+│  │   Skills: rdna4-mixed-precision-quantization.md, rdna4-wmma-register-layout.md
+│  │   Ref:    kernels/wmma_mixed_preshuffle_gemm.py
+│
+├─ Elementwise / Reduction / Normalization
+│  │   Skills: flydsl-api-dictionary.md (arith, vector, scf, gpu sections)
+│  │   Ref:    tests/kernels/test_softmax.py, test_layernorm.py, test_rmsnorm.py
+│
+└─ Something new
+    Skills: rdna4-flydsl-kernel-skeleton.md + flydsl-api-dictionary.md +
+            rdna4-buffer-ops-and-memory.md + rdna4-wmma-register-layout.md
 ```
 
-### Tolerance guidelines
+### 1.3 Write the kernel
 
-| Kernel Type | Metric | Threshold | Rationale |
-|---|---|---|---|
-| GEMM (bf16) | Relative error | < 0.01 (1%) | Straightforward matmul |
-| GEMM (fp8) | Relative error | < 0.05 (5%) | FP8 has limited precision |
-| Attention | Cosine similarity | > 0.99 | Softmax amplifies errors |
-| MoE | Relative error (nonzero mask) | < 0.15 (15%) | Routing + SiLU + multi-expert accumulation |
-| W4A16 | Relative error | < 0.05 (5%) | INT4 quantization noise |
-| Elementwise | Max absolute error | < 1e-5 | Should be nearly exact |
+1. Copy skeleton from `rdna4-flydsl-kernel-skeleton.md`
+2. Look up every API call in `flydsl-api-dictionary.md` — match by section:
 
-### Reference computation rules
+   | Task | Dictionary Section |
+   |---|---|
+   | Constants, arithmetic | Section 2 (arith) |
+   | Global memory load/store | Section 3 (buffer_ops) |
+   | WMMA instructions | Section 4 (rocdl) |
+   | Vector extract/bitcast/shuffle | Section 5 (vector) |
+   | Loops (for/while) and if/else | Section 6 (scf) |
+   | Thread IDs, barriers, shuffles | Section 7 (gpu) |
+   | LDS load/store | Section 8 (memref) + Section 12 (SmemAllocator) |
+   | Fast math intrinsics | Section 9 (llvm) |
+   | Type constructors | Section 13 (Types / T) |
 
-1. **Always compute in float32**: `A.float() @ B.float()`, not `A @ B`
-2. **Use nonzero masking for sparse outputs**: MoE and attention may have zero-padded slots
-3. **Match the kernel's output dtype for comparison**: Cast reference back to output dtype only if needed
-4. **Seed random inputs**: `torch.manual_seed(42)` for reproducibility
-5. **Scale inputs**: Use `* 0.1` to keep values small (avoids fp16/bf16 overflow)
+3. Check `rdna4-wmma-register-layout.md` for WMMA operand rules:
+   - bf16 must be bitcast to `v8i16` before WMMA
+   - fp8 operands are `v2i32`
+   - Result is `v8f32`
 
----
+4. Check `rdna4-buffer-ops-and-memory.md` for memory access rules:
+   - `buffer_ops.create_buffer_resource()` for every tensor
+   - Offsets are in elements (API converts to bytes)
+   - Predicated loads use `mask=` parameter
 
-## Step 5: Run & Debug
+5. Check `rdna4-flydsl-kernel-skeleton.md` for the common pitfalls checklist
 
-### Run the test
+### 1.4 Compile and fix errors
 
 ```bash
 cd /root/e2e/FlyDSL
@@ -209,76 +125,153 @@ PYTHONPATH="$(pwd)/flydsl/src:$(pwd)/.flir/build/python_packages/flydsl:$(pwd):$
 python tests/kernels/test_my_kernel.py
 ```
 
-### Debug with IR dumps
+Common compilation errors:
 
-```bash
-FLIR_DUMP_IR=1 FLIR_DUMP_DIR=my_ir_dumps python tests/kernels/test_my_kernel.py
-# Check my_ir_dumps/<kernel_name>/ for intermediate MLIR stages
-```
-
-### Compile-only mode (no GPU needed)
-
-```bash
-FLYDSL_COMPILE_ONLY=1 FLYDSL_TARGET_ARCH=gfx1201 python tests/kernels/test_my_kernel.py
-```
-
-### Common errors and fixes
-
-| Error | Likely Cause | Fix |
+| Error | Cause | Fix |
 |---|---|---|
-| `ArithValue not accepted` | Passed wrapper to raw MLIR API | Use `arith.unwrap(val)` or `_unwrap(val)` |
-| `type mismatch in operand` | Wrong vector type for WMMA | Check bitcast: bf16->i16, fp8->i32 |
-| `offset must be i32` | Passed index to buffer_load | Use `arith.index_cast(i32, val)` |
-| `scf.for body not terminated` | Missing yield in loop | Add `scf.yield_([...])` |
-| `operation does not dominate use` | Value defined inside if used outside | Use `scf.IfOp` with result types |
-| Shared memory overflow | Too much LDS allocated | Check `SmemAllocator` total vs 64KB limit |
+| `ArithValue not accepted` | Wrapper passed to raw MLIR | `arith.unwrap(val)` |
+| `type mismatch in operand` | Wrong vector type for WMMA | Check bitcast rules |
+| `offset must be i32` | index passed to buffer_load | `arith.index_cast(i32, val)` |
+| `scf.for body not terminated` | Missing yield | Add `scf.yield_([...])` |
+| `does not dominate use` | Value defined inside if | Use `scf.IfOp` with results |
+| Shared memory overflow | LDS > 64KB | Reduce `SmemAllocator` total |
 
 ---
 
-## Step 6: Benchmark
+## Phase 2: Correctness
 
-**Skill**: `rdna4-dispatch-and-benchmarking.md`
+### 2.1 Write reference implementation
 
-### Benchmark function template
+**Rules**:
+1. Compute in **float32**: `A.float() @ B.float()`, never `A @ B` in reduced precision
+2. Use `torch.manual_seed(42)` for reproducibility
+3. Scale inputs: `* 0.1` to avoid bf16 overflow
+4. Mask sparse outputs: MoE and attention may have zero-padded slots
+
+### 2.2 Correctness test structure
 
 ```python
-def benchmark(M, N, K, iters=100):
-    exe = compile_my_kernel(M=M, N=N, K=K)
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+import torch
+from flydsl.runtime.device import get_rocm_arch
+
+def reference_compute(A, B):
+    return (A.float() @ B.float())  # always float32
+
+def test_correctness(M, N, K):
+    torch.manual_seed(42)
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     B = torch.randn(K, N, dtype=torch.bfloat16, device="cuda") * 0.1
     C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    expected = reference_compute(A, B)
 
+    exe = compile_my_kernel(M=M, N=N, K=K)
+    exe(C, A, B, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+
+    # Metrics
+    max_abs_err = (C.float() - expected).abs().max().item()
+    rel_err = max_abs_err / (expected.abs().max().item() + 1e-8)
+    cos_sim = torch.nn.functional.cosine_similarity(
+        C.float().flatten().unsqueeze(0), expected.flatten().unsqueeze(0)
+    ).item()
+
+    return {"max_abs_err": max_abs_err, "rel_err": rel_err, "cos_sim": cos_sim}
+```
+
+### 2.3 Tolerance thresholds
+
+| Kernel Type | Primary Metric | Threshold | Rationale |
+|---|---|---|---|
+| GEMM (bf16) | Relative error | < 0.01 (1%) | Straightforward matmul |
+| GEMM (fp8) | Relative error | < 0.05 (5%) | FP8 limited precision |
+| Attention | Cosine similarity | > 0.99 | Softmax amplifies errors |
+| MoE | Relative error (nonzero mask) | < 0.15 (15%) | Routing + SiLU + multi-expert |
+| W4A16 | Relative error | < 0.05 (5%) | INT4 quantization noise |
+| Elementwise | Max absolute error | < 1e-5 | Nearly exact |
+| Softmax / Norm | Cosine similarity | > 0.999 | Output distribution matters |
+
+### 2.4 Run across multiple shapes
+
+Test at least 3 shape categories:
+- **Small**: exercises edge cases (M=16, N=16, K=16)
+- **Medium**: typical workload (M=256, N=256, K=256 or problem-specific)
+- **Large**: production scale (M=4096, N=4096, K=4096 or problem-specific)
+
+### 2.5 Produce Correctness Report
+
+```
+## Correctness Report: <kernel_name>
+
+### Test Configuration
+- GPU: gfx1201 (RDNA4)
+- Precision: bf16 (or fp8/int4)
+- Reference: float32 PyTorch
+
+### Results
+
+| Shape (M,N,K) | Max Abs Error | Relative Error | Cosine Sim | PASS/FAIL |
+|---|---|---|---|---|
+| 256,256,256   | 0.00123       | 0.0031         | 0.99998    | PASS      |
+| 2048,2048,2048| 0.00456       | 0.0089         | 0.99995    | PASS      |
+| 4096,4096,4096| 0.00567       | 0.0092         | 0.99994    | PASS      |
+
+### Verdict: PASS (all shapes within bf16 GEMM tolerance of 1% relative error)
+```
+
+---
+
+## Phase 3: Profile & Analyze
+
+### 3.1 Baseline measurement
+
+Measure the kernel AND the baseline(s) using the same methodology.
+
+**Compute-bound kernels** (GEMM, attention matmul):
+
+```python
+def benchmark(M, N, K, iters=100):
+    # ... setup ...
     # Warmup
-    for _ in range(5):
-        exe(C, A, B, torch.cuda.current_stream().cuda_stream)
+    for _ in range(10):
+        exe(C, A, B, stream_ptr)
     torch.cuda.synchronize()
 
     # Timed loop
     torch.cuda.synchronize()
-    t0 = time.time()
+    t0 = time.perf_counter()
     for _ in range(iters):
-        exe(C, A, B, torch.cuda.current_stream().cuda_stream)
+        exe(C, A, B, stream_ptr)
     torch.cuda.synchronize()
-    avg_ms = (time.time() - t0) / iters * 1000
+    avg_ms = (time.perf_counter() - t0) / iters * 1000
 
     tflops = 2 * M * N * K / (avg_ms / 1000) / 1e12
-    print(f"M={M} N={N} K={K}: {avg_ms:.3f} ms, {tflops:.1f} TFLOPS")
+    return avg_ms, tflops
+
+# Baseline: PyTorch/rocBLAS
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+for _ in range(iters):
+    torch.mm(A, B, out=C_ref)
+torch.cuda.synchronize()
+rocblas_ms = (time.perf_counter() - t0) / iters * 1000
+rocblas_tflops = 2 * M * N * K / (rocblas_ms / 1000) / 1e12
 ```
 
-### Baselines to compare against
-
-| Baseline | How to Measure |
-|---|---|
-| rocBLAS | `torch.mm(A, B)` with same dtype, timed the same way |
-| Triton | Write equivalent Triton kernel, time with same methodology |
-| Theoretical peak | RDNA4 gfx1201: ~122 TFLOPS bf16, ~244 TFLOPS fp8 |
-
-### Measuring dispatch overhead
-
-For latency-sensitive kernels (decode attention, GEMV), measure dispatch separately:
+**Memory-bound kernels** (softmax, layernorm, elementwise):
 
 ```python
-# No-sync timing (dispatch only)
+total_bytes = read_bytes + write_bytes
+# Example: softmax reads MxN, writes MxN -> 2 * M * N * elem_size
+bandwidth_gbs = total_bytes / (avg_us / 1e6) / 1e9
+```
+
+**Latency-sensitive kernels** (decode attention, GEMV):
+
+Also measure dispatch overhead separately — see `rdna4-dispatch-and-benchmarking.md`:
+```python
+# Dispatch-only (no sync)
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 for _ in range(5000):
@@ -288,73 +281,347 @@ dispatch_us = (t1 - t0) / 5000 * 1e6
 torch.cuda.synchronize()
 ```
 
+### 3.2 Roofline analysis
+
+Determine whether the kernel is compute-bound or memory-bound.
+
+#### RDNA4 gfx1201 hardware specs
+
+| Parameter | Value |
+|---|---|
+| CUs | 64 |
+| SIMDs per CU | 2 |
+| Wave size | 32 |
+| VGPRs per SIMD | 512 (max 256 per wave) |
+| LDS per workgroup | 64 KB |
+| Peak bf16 TFLOPS | ~122 TFLOPS |
+| Peak fp8 TFLOPS | ~244 TFLOPS |
+| Peak memory bandwidth | ~492 GB/s (measured) |
+| L2 cache | 4 MB |
+| Kernel launch overhead | ~5.6 us (Triton noop) |
+| FlyDSL dispatch overhead | ~18 us (optimized) |
+
+#### Arithmetic intensity calculation
+
+```
+Arithmetic Intensity (AI) = FLOPs / Bytes_accessed
+
+For GEMM C[M,N] = A[M,K] * B[K,N]:
+  FLOPs = 2 * M * N * K
+  Bytes  = (M*K + K*N + M*N) * elem_bytes
+  AI     = 2*M*N*K / ((M*K + K*N + M*N) * elem_bytes)
+
+For bf16 (2 bytes): AI = 2*M*N*K / ((M*K + K*N + M*N) * 2)
+For 4096x4096x4096 bf16: AI = 2*4096^3 / (3*4096^2*2) = 1365 FLOPs/byte
+```
+
+#### Roofline ridge point
+
+```
+Ridge Point = Peak TFLOPS / Peak Bandwidth
+            = 122 TFLOPS / 0.492 TB/s
+            = 248 FLOPs/byte
+
+If AI > 248: kernel is compute-bound → optimize for WMMA utilization
+If AI < 248: kernel is memory-bound → optimize for bandwidth utilization
+```
+
+#### Roofline achievable performance
+
+```
+Achievable TFLOPS = min(Peak_TFLOPS, AI * Peak_BW)
+
+For GEMM 4096^3 bf16: AI=1365 >> 248, so compute-bound
+  Achievable = 122 TFLOPS (peak)
+  Measured   = 134 TFLOPS (preshuffle)
+  Efficiency = 134/122 = 110% (exceeds nominal peak via instruction overlap)
+
+For softmax 1x8192 bf16: AI = 2 FLOPs/byte, memory-bound
+  Achievable = 2 * 492 GB/s = 0.984 TFLOPS
+  Optimize for bandwidth, not compute
+```
+
+### 3.3 ISA analysis
+
+Dump and analyze the generated assembly:
+
+```bash
+FLIR_DUMP_IR=1 FLIR_DUMP_DIR=my_ir_dumps python test_my_kernel.py
+# Check: my_ir_dumps/<kernel_name>/15_final_isa.s
+```
+
+**Extract from ISA header** (look for these in the `.s` file):
+```
+; NumVGPRs: 88         → register pressure
+; NumSGPRs: 42         → scalar register usage
+; ScratchSize: 0       → spilling (must be 0 for good perf)
+; LDS Size: 16384      → shared memory usage
+```
+
+**Occupancy from VGPR count**:
+
+| VGPRs | Waves/SIMD | Occupancy Level |
+|---|---|---|
+| <= 96 | 5 (max on RDNA4) | Maximum |
+| <= 128 | 4 | High |
+| <= 168 | 3 | Medium |
+| <= 256 | 2 | Low |
+| > 256 | 1 | Minimum (avoid) |
+
+**Key ISA patterns to check**:
+
+| Pattern | What It Means | Good/Bad |
+|---|---|---|
+| `s_clause N` | Batched N+1 consecutive loads | Good — memory latency hiding |
+| `v_wmma_f32_16x16x16_bf16` | WMMA instruction | Good — matrix compute |
+| `buffer_load_b128` | 128-bit global load | Good — max bandwidth |
+| `buffer_load_b32` | 32-bit global load | Bad — 4x less bandwidth |
+| `scratch_load/store` | Register spilling | Bad — VGPR overflow |
+| `s_waitcnt vmcnt(0)` | Waiting for all loads | Bad — no latency hiding |
+| `s_wait_loadcnt 0` | Waiting for all loads (RDNA4) | Bad — same issue |
+| `ds_load_b128` | 128-bit LDS load | Good — max LDS bandwidth |
+
+### 3.4 Gap analysis
+
+Compare measured performance against achievable ceiling:
+
+```
+Performance Gap = 1 - (Measured / Achievable)
+
+For compute-bound GEMM:
+  Measured = 100 TFLOPS, Peak = 122 TFLOPS
+  Gap = 1 - 100/122 = 18%
+  → Room for improvement: optimize WMMA utilization, reduce stalls
+
+For memory-bound softmax:
+  Measured BW = 350 GB/s, Peak BW = 492 GB/s
+  Gap = 1 - 350/492 = 29%
+  → Room for improvement: optimize coalescing, reduce redundant loads
+```
+
+**Identify the bottleneck**:
+
+| Symptom | Bottleneck | Action |
+|---|---|---|
+| TFLOPS < 50% of peak, ISA shows many `s_waitcnt` | Memory latency | Add prefetching / software pipeline |
+| TFLOPS < 50% of peak, ISA shows `scratch_load` | Register spilling | Reduce VGPRs, smaller tiles |
+| TFLOPS plateaus at ~80% of peak | Instruction scheduling | Try scheduling hints (`sched_barrier`) |
+| BW < 50% of peak | Poor coalescing | Check access patterns, add vectorization |
+| BW < 50% of peak, high LDS usage | LDS bank conflicts | Add K-padding or XOR-swizzle |
+| Dispatch time > GPU time | Dispatch overhead | Measure dispatch separately (see 3.1) |
+
 ---
 
-## Step 7: Optimize
+## Phase 4: Optimize (Iterative Loop)
 
 **Skill**: `rdna4-kernel-optimization-evolution.md`
 
-### Optimization checklist (in priority order)
+### Optimization strategy priority
 
-1. **Eliminate LDS if possible** — preshuffle layout enables direct GMEM->register WMMA
-2. **Maximize memory coalescing** — contiguous lane access to contiguous addresses
-3. **Avoid VGPR reuse serialization** — don't write-then-read the same register bank
-4. **Software pipeline** — overlap GMEM loads with WMMA compute (double buffering)
-5. **K-unroll** — 2x or 4x K-unroll to fill the pipeline
-6. **Bank conflict avoidance** — K-padding or XOR-swizzle for LDS
-7. **Register pressure** — keep VGPRs under 128 for 2 waves/EU occupancy
-8. **L2 cache swizzle** — reorder block IDs for spatial locality
+Apply in this order. **After each change, re-measure and record the result.**
 
-### Performance profiling
+| Priority | Strategy | Applies When | Expected Gain |
+|---|---|---|---|
+| 1 | Eliminate LDS (preshuffle layout) | GEMM with LDS bottleneck | 1.5-3x |
+| 2 | Maximize memory coalescing | Any kernel with strided access | 1.2-2x |
+| 3 | Fix VGPR reuse serialization | ISA shows back-to-back WAW | 1.1-1.3x |
+| 4 | Software pipeline (double buffer) | GMEM loads stalling WMMA | 1.2-1.5x |
+| 5 | K-unroll (2x or 4x) | Compute-bound, short inner loop | 1.1-1.3x |
+| 6 | LDS bank conflict avoidance | LDS-based kernel, ds_load stalls | 1.1-1.2x |
+| 7 | Register pressure reduction | VGPRs > 128, low occupancy | 1.1-1.3x |
+| 8 | L2 cache swizzle | Large problem, poor L2 hit rate | 1.05-1.15x |
+| 9 | Scheduling hints | Fine-tuning after other opts | varies |
+
+### Iteration tracking template
+
+For EACH optimization attempt, record:
+
+```
+### Attempt N: <strategy name>
+
+**Change**: <what was modified>
+**Hypothesis**: <why this should help>
+**Measured**:
+  - Before: <TFLOPS / BW / latency>
+  - After:  <TFLOPS / BW / latency>
+  - Delta:  <+X% or -Y%>
+**ISA impact**: VGPRs <before→after>, scratch <before→after>
+**Verdict**: KEEP / REVERT
+**Notes**: <observations, surprises>
+```
+
+### When to stop
+
+| Condition | Action |
+|---|---|
+| >= 90% of rocBLAS/peak | Stop — production ready |
+| 80-90% of peak | Acceptable. Try 1-2 more strategies, then stop |
+| 50-80% of peak | Review memory access patterns and ISA for obvious issues |
+| < 50% of peak | Fundamental design issue — reconsider the kernel pattern |
+
+---
+
+## Phase 5: Final Reports
+
+The agent MUST deliver two reports at the end.
+
+### 5.1 Correctness Report
+
+```
+═══════════════════════════════════════════════════════
+CORRECTNESS REPORT: <kernel_name>
+═══════════════════════════════════════════════════════
+
+Kernel:      <kernel_name>
+File:        kernels/<kernel_file>.py
+Test:        tests/kernels/test_<kernel_name>.py
+GPU:         gfx1201 (RDNA4)
+Precision:   <bf16 / fp8 / int4 / mixed>
+Reference:   float32 PyTorch
+
+RESULTS:
+┌──────────────────┬──────────────┬──────────────┬──────────┬────────┐
+│ Shape            │ Max Abs Err  │ Relative Err │ Cos Sim  │ Status │
+├──────────────────┼──────────────┼──────────────┼──────────┼────────┤
+│ 256x256x256      │ 0.00123      │ 0.0031       │ 0.99998  │ PASS   │
+│ 2048x2048x2048   │ 0.00456      │ 0.0089       │ 0.99995  │ PASS   │
+│ 4096x4096x4096   │ 0.00567      │ 0.0092       │ 0.99994  │ PASS   │
+└──────────────────┴──────────────┴──────────────┴──────────┴────────┘
+
+VERDICT: PASS — all shapes within tolerance (<1% relative error for bf16 GEMM)
+```
+
+### 5.2 Optimization Report
+
+```
+═══════════════════════════════════════════════════════
+OPTIMIZATION REPORT: <kernel_name>
+═══════════════════════════════════════════════════════
+
+Kernel:      <kernel_name>
+GPU:         gfx1201 (RDNA4), 64 CUs, wave32
+Precision:   bf16
+Peak:        122 TFLOPS (bf16)
+Peak BW:     492 GB/s
+
+─── ROOFLINE ANALYSIS ───
+
+Arithmetic Intensity: 1365 FLOPs/byte (4096x4096x4096 bf16)
+Ridge Point:          248 FLOPs/byte
+Classification:       COMPUTE-BOUND
+Achievable Ceiling:   122 TFLOPS
+
+─── ISA ANALYSIS ───
+
+VGPRs:      88
+SGPRs:      42
+Scratch:    0 bytes (no spilling)
+LDS:        0 bytes (preshuffle, no LDS)
+Occupancy:  5 waves/SIMD
+
+─── BASELINE MEASUREMENTS ───
+
+┌──────────────────┬────────────┬────────────────┬─────────────┐
+│ Shape            │ rocBLAS    │ Kernel v1      │ Efficiency  │
+├──────────────────┼────────────┼────────────────┼─────────────┤
+│ 2048x2048x2048   │ 95 TFLOPS  │ 60 TFLOPS      │ 63%         │
+│ 4096x4096x4096   │ 120 TFLOPS │ 72 TFLOPS      │ 60%         │
+└──────────────────┴────────────┴────────────────┴─────────────┘
+
+─── OPTIMIZATION ITERATIONS ───
+
+Attempt 1: Preshuffle B operand
+  Change:     Removed B LDS loads, use preshuffled GMEM layout
+  Hypothesis: Eliminate ds_load WAW hazards on B
+  Before:     72 TFLOPS (4096^3)
+  After:      95 TFLOPS (4096^3)
+  Delta:      +32%
+  ISA:        VGPRs 112→96, removed all ds_load_b128 for B
+  Verdict:    KEEP
+
+Attempt 2: Preshuffle A operand
+  Change:     Also preshuffle A, eliminate all LDS
+  Hypothesis: Remove remaining LDS overhead
+  Before:     95 TFLOPS
+  After:      120 TFLOPS
+  Delta:      +26%
+  ISA:        VGPRs 96→88, LDS 16KB→0
+  Verdict:    KEEP
+
+Attempt 3: K-unroll x4
+  Change:     Unroll inner K loop by 4
+  Hypothesis: Better instruction scheduling, fill pipeline
+  Before:     120 TFLOPS
+  After:      134 TFLOPS
+  Delta:      +12%
+  ISA:        VGPRs 88→112, s_clause 7 (8 batched loads)
+  Verdict:    KEEP
+
+Attempt 4: Scheduling hints (sched_barrier)
+  Change:     Added rocdl.sched_barrier between load and compute
+  Hypothesis: Force better instruction interleaving
+  Before:     134 TFLOPS
+  After:      131 TFLOPS
+  Delta:      -2%
+  Verdict:    REVERT — RDNA4 scheduler handles this well without hints
+
+─── FINAL RESULTS ───
+
+┌──────────────────┬────────────┬────────────────┬─────────────┬───────────┐
+│ Shape            │ rocBLAS    │ Final Kernel   │ Efficiency  │ vs Peak   │
+├──────────────────┼────────────┼────────────────┼─────────────┼───────────┤
+│ 2048x2048x2048   │ 95 TFLOPS  │ 105 TFLOPS     │ 111%        │ 86%       │
+│ 4096x4096x4096   │ 120 TFLOPS │ 134 TFLOPS     │ 112%        │ 110%      │
+└──────────────────┴────────────┴────────────────┴─────────────┴───────────┘
+
+Gap: 0% (exceeds rocBLAS at large shapes)
+Verdict: PRODUCTION READY
+
+─── EFFORTS SUMMARY ───
+
+Total attempts:  4
+Kept:            3 (preshuffle B, preshuffle A, K-unroll x4)
+Reverted:        1 (scheduling hints — hurt performance)
+Total speedup:   72 → 134 TFLOPS (1.86x from v1)
+Key insight:     Eliminating LDS entirely via preshuffle was the single
+                 biggest win (60% → 110% of rocBLAS). Scheduling hints
+                 should be avoided on RDNA4 — the hardware scheduler is
+                 already effective.
+```
+
+---
+
+## Run Environment
 
 ```bash
-# Dump ISA for analysis
-FLIR_DUMP_IR=1 python test_my_kernel.py
-# Check my_ir_dumps/<kernel>/15_final_isa.s
-
-# Count VGPRs, SGPRs, occupancy from ISA header
-# Look for: .vgpr_count, .sgpr_count, .lds_size
+cd /root/e2e/FlyDSL
+ROCR_VISIBLE_DEVICES=0 \
+PYTHONPATH="$(pwd)/flydsl/src:$(pwd)/.flir/build/python_packages/flydsl:$(pwd):${PYTHONPATH}" \
+python <script>
 ```
 
-### When to stop optimizing
+### Useful commands
 
-- Within 90% of rocBLAS → good for production
-- Within 80% → review memory access patterns
-- Below 50% → likely a fundamental design issue, reconsider the pattern
+```bash
+# Correctness test
+python tests/kernels/test_my_kernel.py
 
----
+# Dump MLIR IR at each compilation stage
+FLIR_DUMP_IR=1 FLIR_DUMP_DIR=my_ir_dumps python tests/kernels/test_my_kernel.py
 
-## Quick Decision Tree
+# Compile without GPU (cross-compilation check)
+FLYDSL_COMPILE_ONLY=1 FLYDSL_TARGET_ARCH=gfx1201 python tests/kernels/test_my_kernel.py
 
-```
-What kind of kernel?
-│
-├─ Matrix multiply (GEMM)
-│  ├─ Large M,N,K (prefill) → rdna4-gemm-kernel-patterns.md (preshuffle pattern)
-│  ├─ Small M (decode GEMV) → rdna4-mixed-precision-quantization.md (W4A16 GEMV)
-│  └─ MoE routing          → rdna4-moe-gemm-kernel.md
-│
-├─ Attention
-│  ├─ Decode (small Q)      → rdna4-attention-kernel.md (WMMA hybrid)
-│  └─ Prefill (large Q)     → rdna4-attention-kernel.md (Split-KV)
-│
-├─ Quantized inference
-│  ├─ INT4 weight-only      → rdna4-mixed-precision-quantization.md
-│  └─ FP8 compute           → rdna4-mixed-precision-quantization.md
-│
-├─ Elementwise / Reduction
-│  └─ Use API dictionary directly → flydsl-api-dictionary.md
-│
-└─ Something new
-   ├─ Start with skeleton   → rdna4-flydsl-kernel-skeleton.md
-   ├─ API reference          → flydsl-api-dictionary.md
-   ├─ Memory patterns        → rdna4-buffer-ops-and-memory.md
-   └─ WMMA details           → rdna4-wmma-register-layout.md
+# Profile with rocprofv3
+rocprofv3 --hip-trace python tests/kernels/profile_gemm.py flydsl 4096
+
+# Occupancy control
+# In kernel code: _apply_waves_per_eu_hint(m.module, waves_per_eu=2)
 ```
 
 ---
 
-## File Organization Convention
+## File Organization
 
 ```
 FlyDSL/
