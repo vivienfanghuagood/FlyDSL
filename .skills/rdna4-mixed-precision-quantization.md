@@ -11,7 +11,7 @@ This skill covers FP8, INT4 (W4A16), and mixed bf16+fp8 quantization patterns.
 |---|---|---|
 | `kernels/wmma_mixed_preshuffle_gemm.py` | fp8+fp8, bf16+fp8, bf16+int4 | Mixed-precision preshuffle GEMM (249T fp8) |
 | `kernels/wmma_w4a16_gemv.py` | bf16+int4 | W4A16 GEMV for decode (small-M) |
-| `kernels/wmma_moe_gemm.py` | bf16 (with SiLU) | Two-stage MoE GEMM |
+
 
 ## Precision Paths Summary
 
@@ -136,22 +136,7 @@ for si in range(8):
     buffer_ops.buffer_store(val_bf16, c_rsrc, elem_off)
 ```
 
-## Fast Math Intrinsics for Activation Functions
-
-### SiLU (Sigmoid Linear Unit)
-
-Used in MoE gate+up projection: `SiLU(x) = x * sigmoid(x)`
-
-```python
-# sigmoid(x) = 1 / (1 + exp(-x))
-# Using exp2 intrinsic for speed:
-neg_gate = gate_val * (-1.4426950408889634)  # -log2(e)
-emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [neg_gate])
-den = 1.0 + emu
-sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den])
-silu_gate = gate_val * sig
-result = silu_gate * up_val
-```
+## Fast Math Intrinsics for Quantization
 
 ### exp2 for Softmax
 
@@ -159,52 +144,4 @@ result = silu_gate * up_val
 LOG2E = 1.4426950408889634
 # exp(x) = exp2(x * log2(e))
 exp_val = flydsl_math.exp2(arith.as_value(x * LOG2E))
-```
-
-## MoE (Mixture of Experts) Kernel Design
-
-### Two-Stage Architecture
-
-**Stage 1**: Gate+Up projection with SiLU activation
-```
-out[t, slot, :] = SiLU(X[t] @ W_gate[e]) * (X[t] @ W_up[e])
-```
-
-**Stage 2**: Down projection with topk-weighted reduction
-```
-Y[t] += weight[t,slot] * A2[t,slot] @ W_down[e]
-```
-
-### Token Routing
-
-MoE kernels use sorted_token_ids to map workgroup rows to actual tokens:
-
-```python
-# sorted_token_ids packs token_id and slot in one i32:
-#   bits[0:24]  = token_id (masked with 0xFFFFFF)
-#   bits[24:32] = slot_id (top-k index)
-fused_i = buffer_load(sorted_rsrc, sorted_row, vec_width=1, dtype=i32)
-token_id = fused_i & 0xFFFFFF
-slot_id = fused_i >> 24
-```
-
-### Block Validity Check
-
-MoE kernels check `max_token_ids` to skip empty blocks:
-
-```python
-bx_m_i32 = arith.index_cast(i32, bx * tile_m)
-max_token_id = buffer_load(maxids_rsrc, index(0), vec_width=1, dtype=i32)
-blk_valid = arith.cmpu(bx_m_i32, max_token_id, "ult")
-with scf.IfOp(blk_valid).then():
-    # ... kernel body ...
-```
-
-### Grid Layout for MoE
-
-```python
-# blockIdx.x -> N tile (output dimension)
-# blockIdx.y -> M tile (expert block from routing)
-gx = inter_dim / tile_n
-gy = num_expert_blocks  # from routing table
 ```
