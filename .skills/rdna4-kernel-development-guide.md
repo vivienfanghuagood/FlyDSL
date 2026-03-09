@@ -148,7 +148,26 @@ Common compilation errors:
 3. Scale inputs: `* 0.1` to avoid bf16 overflow
 4. Mask sparse outputs: MoE and attention may have zero-padded slots
 
-### 2.2 Correctness test structure
+### 2.2 Correctness metrics: rtol and atol
+
+Use **rtol** (relative tolerance) and **atol** (absolute tolerance) as the primary
+correctness metrics. These check every element individually and catch outliers that
+aggregate metrics like cosine similarity would hide.
+
+**Why not cosine similarity?** Cosine similarity measures global directional agreement
+across all elements. A result with a few wildly wrong values (e.g., 10x off) can still
+show cos_sim > 0.999 if the remaining thousands of elements are close. This masks
+real bugs. Use `rtol` and `atol` with per-element checking instead.
+
+**Per-element correctness check**:
+```
+For each element i:
+  |actual[i] - expected[i]| <= atol + rtol * |expected[i]|
+```
+
+This is the same formula as `torch.allclose(actual, expected, rtol=R, atol=A)`.
+
+### 2.3 Correctness test structure
 
 ```python
 import sys, os
@@ -158,6 +177,42 @@ from flydsl.runtime.device import get_rocm_arch
 
 def reference_compute(A, B):
     return (A.float() @ B.float())  # always float32
+
+def check_correctness(actual, expected, rtol, atol, label=""):
+    """Per-element rtol/atol check with detailed error reporting."""
+    diff = (actual.float() - expected.float()).abs()
+    threshold = atol + rtol * expected.float().abs()
+    violations = diff > threshold
+    num_violations = violations.sum().item()
+    total = actual.numel()
+    pass_rate = 1.0 - num_violations / total
+
+    # Worst-case metrics
+    max_abs_err = diff.max().item()
+    max_rel_err = (diff / (expected.float().abs() + 1e-8)).max().item()
+
+    # Percentile errors (more informative than max alone)
+    sorted_diff = diff.flatten().sort().values
+    p99_abs_err = sorted_diff[int(0.99 * total)].item()
+    p999_abs_err = sorted_diff[min(int(0.999 * total), total - 1)].item()
+
+    result = {
+        "pass": num_violations == 0,
+        "pass_rate": pass_rate,
+        "num_violations": num_violations,
+        "total_elements": total,
+        "max_abs_err": max_abs_err,
+        "max_rel_err": max_rel_err,
+        "p99_abs_err": p99_abs_err,
+        "p999_abs_err": p999_abs_err,
+        "rtol": rtol,
+        "atol": atol,
+    }
+    status = "PASS" if result["pass"] else "FAIL"
+    print(f"[{label}] {status}: {num_violations}/{total} violations "
+          f"(max_abs={max_abs_err:.6f}, max_rel={max_rel_err:.6f}, "
+          f"p99_abs={p99_abs_err:.6f}, pass_rate={pass_rate*100:.4f}%)")
+    return result
 
 def test_correctness(M, N, K):
     torch.manual_seed(42)
@@ -170,36 +225,35 @@ def test_correctness(M, N, K):
     exe(C, A, B, torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
 
-    # Metrics
-    max_abs_err = (C.float() - expected).abs().max().item()
-    rel_err = max_abs_err / (expected.abs().max().item() + 1e-8)
-    cos_sim = torch.nn.functional.cosine_similarity(
-        C.float().flatten().unsqueeze(0), expected.flatten().unsqueeze(0)
-    ).item()
-
-    return {"max_abs_err": max_abs_err, "rel_err": rel_err, "cos_sim": cos_sim}
+    return check_correctness(C, expected, rtol=1e-2, atol=1e-3,
+                             label=f"{M}x{N}x{K}")
 ```
 
-### 2.3 Tolerance thresholds
+### 2.4 Tolerance thresholds
 
-| Kernel Type | Primary Metric | Threshold | Rationale |
+| Kernel Type | rtol | atol | Rationale |
 |---|---|---|---|
-| GEMM (bf16) | Relative error | < 0.01 (1%) | Straightforward matmul |
-| GEMM (fp8) | Relative error | < 0.05 (5%) | FP8 limited precision |
-| Attention | Cosine similarity | > 0.99 | Softmax amplifies errors |
-| MoE | Relative error (nonzero mask) | < 0.15 (15%) | Routing + SiLU + multi-expert |
-| W4A16 | Relative error | < 0.05 (5%) | INT4 quantization noise |
-| Elementwise | Max absolute error | < 1e-5 | Nearly exact |
-| Softmax / Norm | Cosine similarity | > 0.999 | Output distribution matters |
+| GEMM (bf16) | 1e-2 | 1e-3 | bf16 has ~3 decimal digits of precision |
+| GEMM (fp8) | 5e-2 | 1e-2 | FP8 has ~1.5 decimal digits |
+| Attention | 1e-2 | 1e-3 | Softmax amplifies errors in tail |
+| MoE | 5e-2 | 1e-2 | Routing + SiLU + multi-expert accumulation |
+| W4A16 | 5e-2 | 1e-2 | INT4 quantization noise |
+| Elementwise | 1e-5 | 1e-6 | Same-precision ops should be nearly exact |
+| Softmax / Norm | 1e-3 | 1e-4 | Output distribution sensitive to precision |
 
-### 2.4 Run across multiple shapes
+**If strict rtol/atol fails**, report per-element pass rate and percentile errors:
+- **pass_rate >= 99.9%** with reasonable max error: likely acceptable (tail outliers from precision)
+- **pass_rate < 99%**: real bug — investigate the failing elements' positions for patterns
+  (e.g., tile boundaries, last row/column, masked regions)
+
+### 2.5 Run across multiple shapes
 
 Test at least 3 shape categories:
 - **Small**: exercises edge cases (M=16, N=16, K=16)
 - **Medium**: typical workload (M=256, N=256, K=256 or problem-specific)
 - **Large**: production scale (M=4096, N=4096, K=4096 or problem-specific)
 
-### 2.5 Produce Correctness Report
+### 2.7 Produce Correctness Report
 
 ```
 ## Correctness Report: <kernel_name>
@@ -208,16 +262,17 @@ Test at least 3 shape categories:
 - GPU: gfx1201 (RDNA4)
 - Precision: bf16 (or fp8/int4)
 - Reference: float32 PyTorch
+- Tolerances: rtol=1e-2, atol=1e-3
 
 ### Results
 
-| Shape (M,N,K) | Max Abs Error | Relative Error | Cosine Sim | PASS/FAIL |
-|---|---|---|---|---|
-| 256,256,256   | 0.00123       | 0.0031         | 0.99998    | PASS      |
-| 2048,2048,2048| 0.00456       | 0.0089         | 0.99995    | PASS      |
-| 4096,4096,4096| 0.00567       | 0.0092         | 0.99994    | PASS      |
+| Shape (M,N,K) | Max Abs Err | Max Rel Err | P99 Abs Err | Pass Rate  | Status |
+|---|---|---|---|---|---|
+| 256,256,256    | 0.00123     | 0.0031      | 0.00089     | 100.0000%  | PASS   |
+| 2048,2048,2048 | 0.00456     | 0.0089      | 0.00234     | 100.0000%  | PASS   |
+| 4096,4096,4096 | 0.00567     | 0.0092      | 0.00312     | 99.9998%   | PASS   |
 
-### Verdict: PASS (all shapes within bf16 GEMM tolerance of 1% relative error)
+### Verdict: PASS (all shapes within bf16 GEMM tolerance, rtol=1e-2, atol=1e-3)
 ```
 
 ---
@@ -478,17 +533,21 @@ Test:        tests/kernels/test_<kernel_name>.py
 GPU:         gfx1201 (RDNA4)
 Precision:   <bf16 / fp8 / int4 / mixed>
 Reference:   float32 PyTorch
+Tolerances:  rtol=1e-2, atol=1e-3
 
 RESULTS:
-┌──────────────────┬──────────────┬──────────────┬──────────┬────────┐
-│ Shape            │ Max Abs Err  │ Relative Err │ Cos Sim  │ Status │
-├──────────────────┼──────────────┼──────────────┼──────────┼────────┤
-│ 256x256x256      │ 0.00123      │ 0.0031       │ 0.99998  │ PASS   │
-│ 2048x2048x2048   │ 0.00456      │ 0.0089       │ 0.99995  │ PASS   │
-│ 4096x4096x4096   │ 0.00567      │ 0.0092       │ 0.99994  │ PASS   │
-└──────────────────┴──────────────┴──────────────┴──────────┴────────┘
+┌──────────────────┬─────────────┬─────────────┬─────────────┬───────────┬────────┐
+│ Shape            │ Max Abs Err │ Max Rel Err │ P99 Abs Err │ Pass Rate │ Status │
+├──────────────────┼─────────────┼─────────────┼─────────────┼───────────┼────────┤
+│ 256x256x256      │ 0.00123     │ 0.0031      │ 0.00089     │ 100.000%  │ PASS   │
+│ 2048x2048x2048   │ 0.00456     │ 0.0089      │ 0.00234     │ 100.000%  │ PASS   │
+│ 4096x4096x4096   │ 0.00567     │ 0.0092      │ 0.00312     │ 99.999%   │ PASS   │
+└──────────────────┴─────────────┴─────────────┴─────────────┴───────────┴────────┘
 
-VERDICT: PASS — all shapes within tolerance (<1% relative error for bf16 GEMM)
+VERDICT: PASS — all shapes within tolerance (rtol=1e-2, atol=1e-3 for bf16 GEMM)
+
+Note: Pass Rate = % of elements satisfying |actual-expected| <= atol + rtol*|expected|
+      P99 Abs Err = 99th percentile of per-element absolute errors
 ```
 
 ### 5.2 Optimization Report
