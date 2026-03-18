@@ -26,8 +26,10 @@ KERNEL_NAME = "layernorm"
 
 EPS = 1e-5
 
+from kernels.kernels_common import get_warp_size
+
 BLOCK_THREADS = 256
-WARP_SIZE = 64
+WARP_SIZE = get_warp_size()
 VEC_WIDTH = 8
 USE_NONTEMPORAL = True
 VEC_ALIGN = 16
@@ -88,10 +90,12 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
         def wave_reduce_add(x):
             width_i32 = fx.Int32(WARP_SIZE)
             w = x
-            for sh in [32, 16, 8, 4, 2, 1]:
+            sh = WARP_SIZE // 2
+            while sh >= 1:
                 off = fx.Int32(sh)
                 peer = w.shuffle_xor(off, width_i32)
                 w = w.addf(peer, fastmath=fm_fast)
+                sh //= 2
             return w
 
         def block_reduce_add2(val0, val1):
@@ -162,7 +166,7 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
             c_zero_f = arith.constant(0.0, type=compute_type)
             thread_sum = c_zero_f
             thread_sumsq = c_zero_f
-            cache_as_elem = (dtype_str != "f32")
+            cache_as_elem = dtype_str != "f32"
             in_local = []
 
             vec_type_c = T.vec(VEC_WIDTH, compute_type)
@@ -182,7 +186,10 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
             def _load_vec_buf(rsrc, col_byte_off, soff=None):
                 dw = col_byte_off >> fx.Int32(2)
                 raw = buffer_ops.buffer_load(
-                    rsrc, dw, vec_width=vec_dwords, dtype=T.i32,
+                    rsrc,
+                    dw,
+                    vec_width=vec_dwords,
+                    dtype=T.i32,
                     soffset_bytes=soff,
                 )
                 if vec_dwords == VEC_WIDTH:
@@ -192,7 +199,9 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
             def _store_vec_buf(data, rsrc, col_byte_off, soff=None):
                 dw = col_byte_off >> fx.Int32(2)
                 buffer_ops.buffer_store(
-                    data, rsrc, dw,
+                    data,
+                    rsrc,
+                    dw,
                     soffset_bytes=soff,
                 )
 
@@ -211,12 +220,16 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
                 x_av = ArithValue(x)
                 x2 = x_av * x_av
                 red = vector.reduction(
-                    compute_type, vector.CombiningKind.ADD,
-                    x, fastmath=fm_fast,
+                    compute_type,
+                    vector.CombiningKind.ADD,
+                    x,
+                    fastmath=fm_fast,
                 )
                 red2 = vector.reduction(
-                    compute_type, vector.CombiningKind.ADD,
-                    x2, fastmath=fm_fast,
+                    compute_type,
+                    vector.CombiningKind.ADD,
+                    x2,
+                    fastmath=fm_fast,
                 )
                 thread_sum = ArithValue(thread_sum) + red
                 thread_sumsq = ArithValue(thread_sumsq) + red2
@@ -231,16 +244,8 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
 
             g_e_cur = _load_vec_buf(gamma_rsrc, thr_col_bytes)
             b_e_cur = _load_vec_buf(beta_rsrc, thr_col_bytes)
-            g_cur = (
-                g_e_cur
-                if dtype_str == "f32"
-                else g_e_cur.extf(vec_type_c)
-            )
-            b_cur = (
-                b_e_cur
-                if dtype_str == "f32"
-                else b_e_cur.extf(vec_type_c)
-            )
+            g_cur = g_e_cur if dtype_str == "f32" else g_e_cur.extf(vec_type_c)
+            b_cur = b_e_cur if dtype_str == "f32" else b_e_cur.extf(vec_type_c)
 
             # ── Pass 2: normalize + affine + store ───────────────────────
             for tile_i in range_constexpr(num_tiles_py):
@@ -248,16 +253,8 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
                     next_col_bytes = ArithValue(thr_col_bytes) + ((tile_i + 1) * tile_cols * elem_bytes)
                     g_e_next = _load_vec_buf(gamma_rsrc, next_col_bytes)
                     b_e_next = _load_vec_buf(beta_rsrc, next_col_bytes)
-                    g_next = (
-                        g_e_next
-                        if dtype_str == "f32"
-                        else g_e_next.extf(vec_type_c)
-                    )
-                    b_next = (
-                        b_e_next
-                        if dtype_str == "f32"
-                        else b_e_next.extf(vec_type_c)
-                    )
+                    g_next = g_e_next if dtype_str == "f32" else g_e_next.extf(vec_type_c)
+                    b_next = b_e_next if dtype_str == "f32" else b_e_next.extf(vec_type_c)
                 else:
                     g_next = g_cur
                     b_next = b_cur
@@ -322,9 +319,7 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
             thread_sumsq = c_zero_f
 
             copy_atom_s = fx.make_copy_atom(fx.UniversalCopy(elem_bits), elem_bits)
-            scalar_reg_ty = fx.MemRefType.get(
-                elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
-            )
+            scalar_reg_ty = fx.MemRefType.get(elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
             scalar_reg_lay = fx.make_layout(1, 1)
 
             row_div = fx.logical_divide(row_in, fx.make_layout(1, 1))
@@ -355,11 +350,7 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
                 c0_i = Int32(0)
                 idx_safe = is_valid.select(idx, c0_i)
                 x_e = _load_scalar(row_div, idx_safe)
-                x = (
-                    x_e
-                    if dtype_str == "f32"
-                    else x_e.extf(compute_type)
-                )
+                x = x_e if dtype_str == "f32" else x_e.extf(compute_type)
                 x_av = ArithValue(x)
                 x2 = x_av * x_av
                 x_safe = is_valid.select(x, c_zero_f)
@@ -378,21 +369,9 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
                     x_e = _load_scalar(row_div, idx)
                     g_e = _load_scalar(gamma_div, idx)
                     b_e = _load_scalar(beta_div, idx)
-                    x = (
-                        x_e
-                        if dtype_str == "f32"
-                        else x_e.extf(compute_type)
-                    )
-                    g = (
-                        g_e
-                        if dtype_str == "f32"
-                        else g_e.extf(compute_type)
-                    )
-                    b = (
-                        b_e
-                        if dtype_str == "f32"
-                        else b_e.extf(compute_type)
-                    )
+                    x = x_e if dtype_str == "f32" else x_e.extf(compute_type)
+                    g = g_e if dtype_str == "f32" else g_e.extf(compute_type)
+                    b = b_e if dtype_str == "f32" else b_e.extf(compute_type)
                     diff = ArithValue(x) - mean
                     norm = diff * ArithValue(rstd)
                     scaled = norm * ArithValue(g)
